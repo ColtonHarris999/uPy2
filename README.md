@@ -54,8 +54,10 @@ and `weakref`, none of which exist at the pin.
 | `mpyc/tokens.py` + `lexer.py` — tokenizer | **done except t-strings; 2187 files token-exact** |
 | `mpyc/grammar.py` — grammar tables | **done; numbering confirmed against the C enum** |
 | `mpyc/parser.py` — engine + constant folding | **done except t-strings; 2172 files tree-exact** |
-| scope analysis | next |
-| emitter | not started |
+| `mpyc/scope.py` — scope and identifier analysis | **done** |
+| `mpyc/bytecode.py` — prelude and line-number codec | **done; 10010 functions round-trip** |
+| emitter: opcodes and instruction emission | next |
+| the compiler walker (`py/compile.c`) | not started |
 
 **Container codec: 2083 / 2083 files byte-exact** against the pinned
 `mpy-cross`, over MicroPython's own `tests/`, `lib/micropython-lib`, `tools/`
@@ -317,3 +319,33 @@ they no longer prove is that on-device output matches mpy-cross byte for byte
 on those 42 files — by design, since matching the device is what was asked
 for. Validating those needs the device's own compiler as the reference, which
 the self-hosting bootstrap will provide.
+
+### Scope analysis
+
+A port of `py/scope.c`: one `Scope` per block, names kept in first-mention
+order (that order sets local slot numbers, so it is load-bearing), and the
+closure algorithm that threads a variable from the block reading it up to the
+block owning it — the owner's `LOCAL` becomes `CELL`, and every block between
+gains a `FREE` entry so the value can pass through.
+
+Scopes never leave MicroPython's compiler, so there is no oracle for this
+piece; the tests pin the algorithm's invariants instead, including the cases
+where nothing should happen (a module-level name is global, not free; a name
+no parent owns stays undecided; closing over twice adds no duplicate). A
+400-deep closure resolves iteratively, costing no frames for depth.
+
+### Bytecode prelude
+
+Each function's `fun_data` begins with two bit-interleaved headers — a
+six-value signature packed as `xSSSSEAA [xFSSKAED …]` and a size field as
+`xIIIIIIC …` — then the qstr-indexed name section, a line-number table in two
+alternating formats, and the closure section.
+
+`mpyc/bytecode.py` encodes and decodes all of it. Decoding is what makes the
+encoder testable before the compiler walker exists: every `fun_data` the
+oracle produces can be taken apart and rebuilt, and the bytes must match.
+
+**10010 functions across 2083 oracle-built `.mpy` files round-trip byte for
+byte**, identically under CPython and MicroPython v1.29.0 — exercising both
+header forms, multi-byte extensions, and both line-info encodings over
+whatever shapes the corpus holds.
