@@ -41,7 +41,7 @@ target bans it.
 """
 
 from array import array
-from struct import calcsize
+from struct import calcsize, pack
 
 # MicroPython's array has no .itemsize, so measure the width of one slot once.
 # 'i' is a C int: 4 bytes on every platform MicroPython targets, and the same
@@ -151,6 +151,86 @@ def small_int_value(node):
     return node >> 1
 
 
+class MpStr:
+    """A MicroPython ``str`` constant.
+
+    MicroPython strings are byte sequences, 8-bit clean and not necessarily
+    valid UTF-8 -- a literal may contain lone surrogate escapes.  Decoding to
+    a Python str would not round-trip those, so the bytes are kept as they
+    are and only the type is remembered, which also keeps a str constant
+    distinct from a bytes constant.
+    """
+
+    def __init__(self, data):
+        self.data = data
+
+    def __eq__(self, other):
+        return isinstance(other, MpStr) and other.data == self.data
+
+    def __hash__(self):
+        return hash(self.data)
+
+    def __bool__(self):
+        return len(self.data) != 0
+
+    # MicroPython has no __bool__; it uses __len__ for truthiness.
+    def __len__(self):
+        return len(self.data)
+
+    def __repr__(self):
+        return "MpStr(%r)" % (self.data,)
+
+
+def _scalar_key(value):
+    t = type(value)
+    if t is bool:
+        return ("b", value)
+    if t is int:
+        return ("i", value)
+    if t is float:
+        # The raw bits, not repr: repr cannot tell 0.0 from -0.0 or a NaN
+        # from a negative NaN, and all three are distinct constants.
+        return ("f", pack("<d", value))
+    if t is MpStr:
+        return ("S", value.data)
+    if t is str:
+        return ("s", value)
+    if t is bytes:
+        return ("y", value)
+    if t is complex:
+        return ("c", pack("<d", value.real), pack("<d", value.imag))
+    if value is None:
+        return ("n",)
+    if value is Ellipsis:
+        return ("e",)
+    return ("o", id(value))
+
+
+def const_key(value):
+    """A hashable key that distinguishes constants Python would equate.
+
+    ``1 == 1.0`` and ``0.0 == -0.0``, and both pairs also hash alike, so the
+    key carries the type, and for floats the raw bits.
+
+    A tuple is flattened into prefix form with explicit lengths rather than
+    keyed recursively: tuple nesting follows the source, so recursing here
+    would put an input-dependent depth on a 32-frame stack.
+    """
+    out = []
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        if type(v) is tuple:
+            out.append(("t", len(v)))
+            i = len(v) - 1
+            while i >= 0:
+                stack.append(v[i])
+                i -= 1
+            continue
+        out.append(_scalar_key(v))
+    return tuple(out)
+
+
 class ParseTree:
     """A parse tree held in one flat arena.
 
@@ -169,6 +249,7 @@ class ParseTree:
         self.used = 1
         self.root = NODE_NULL
         self.consts = []
+        self._const_index = {}
 
     # -- arena management -------------------------------------------------
 
@@ -272,18 +353,19 @@ class ParseTree:
     # -- constants --------------------------------------------------------
 
     def add_const(self, value):
-        """Intern *value* in the constant table and return its index."""
-        consts = self.consts
-        i = 0
-        n = len(consts)
-        while i < n:
-            # Compare by type as well, so 1 and 1.0 stay distinct.
-            c = consts[i]
-            if c is value or (type(c) is type(value) and c == value):
-                return i
-            i += 1
-        consts.append(value)
-        return n
+        """Intern *value* in the constant table and return its index.
+
+        Keyed on an exact key rather than ``==``: 1 and 1.0 compare equal in
+        Python, and so do 0.0 and -0.0, but they are different constants.
+        """
+        key = const_key(value)
+        i = self._const_index.get(key)
+        if i is not None:
+            return i
+        i = len(self.consts)
+        self.consts.append(value)
+        self._const_index[key] = i
+        return i
 
     def const(self, index):
         return self.consts[index]

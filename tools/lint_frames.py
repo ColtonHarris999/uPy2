@@ -30,36 +30,53 @@ DEFAULT_BUDGET = 32
 
 
 class Collector(ast.NodeVisitor):
-    """Collect every function definition and the names each one calls."""
+    """Collect every function definition, qualified by its class, and the
+    calls each one makes.
 
-    def __init__(self, path, defs, calls):
+    Definitions are keyed by qualified name (``ParseTree.new_struct``) rather
+    than bare name, because several classes define ``__init__`` and merging
+    them invents call cycles that do not exist.
+
+    Calls resolve in two ways, both deliberately over-approximate -- an upper
+    bound on depth is the safe direction:
+
+    * ``Name(...)`` resolves to a module-level function of that name, or to
+      the ``__init__`` of a class of that name (a constructor call).
+    * ``obj.m(...)`` resolves to *every* method named ``m``, since the
+      receiver's type is unknown.
+    """
+
+    def __init__(self, path, defs, calls, classes):
         self.path = path
         self.defs = defs
         self.calls = calls
+        self.classes = classes
         self.stack = []
 
     def _qual(self, name):
-        return ".".join([s for s in self.stack] + [name])
+        return ".".join(self.stack + [name])
 
     def visit_ClassDef(self, node):
+        self.classes.add(self._qual(node.name))
         self.stack.append(node.name)
-        self.generic_visit(node)
+        for child in node.body:
+            self.visit(child)
         self.stack.pop()
 
     def _function(self, node):
-        key = node.name
-        self.defs.setdefault(key, []).append((self.path, node.lineno,
-                                              self._qual(node.name)))
-        self.stack.append(node.name)
-        inner = self.calls.setdefault(key, set())
+        qual = self._qual(node.name)
+        self.defs[qual] = (self.path, node.lineno, node.name)
+        named = set()
+        attrs = set()
         for sub in ast.walk(node):
             if isinstance(sub, ast.Call):
                 f = sub.func
                 if isinstance(f, ast.Name):
-                    inner.add(f.id)
+                    named.add(f.id)
                 elif isinstance(f, ast.Attribute):
-                    inner.add(f.attr)
-        # Recurse for nested defs/classes so they are registered too.
+                    attrs.add(f.attr)
+        self.calls[qual] = (named, attrs)
+        self.stack.append(node.name)
         for child in node.body:
             self.visit(child)
         self.stack.pop()
@@ -73,7 +90,8 @@ class Collector(ast.NodeVisitor):
 
 def collect(package_dir):
     defs = {}
-    calls = {}
+    raw_calls = {}
+    classes = set()
     for root, dirs, files in os.walk(package_dir):
         for f in sorted(files):
             if not f.endswith(".py"):
@@ -82,7 +100,45 @@ def collect(package_dir):
             with open(path, "r") as fh:
                 src = fh.read()
             tree = ast.parse(src, path)
-            Collector(path, defs, calls).visit(tree)
+            Collector(path, defs, raw_calls, classes).visit(tree)
+
+    # Index the definitions for resolution.
+    plain = {}      # bare name -> [qualname] for module-level functions
+    methods = {}    # method name -> [qualname]
+    inits = {}      # class name -> its __init__ qualname
+    for qual in defs:
+        bare = defs[qual][2]
+        if "." in qual:
+            methods.setdefault(bare, []).append(qual)
+            if bare == "__init__":
+                cls = qual.rsplit(".", 2)[-2]
+                inits[cls] = qual
+        else:
+            plain.setdefault(bare, []).append(qual)
+
+    calls = {}
+    for qual in raw_calls:
+        named, attrs = raw_calls[qual]
+        out = set()
+        for n in named:
+            if n in inits:
+                out.add(inits[n])      # a constructor call
+            for t in plain.get(n, ()):
+                out.add(t)
+            # A bare name may also be a method called without self in a
+            # nested function; only count it if nothing else matched.
+            if n not in inits and n not in plain:
+                for t in methods.get(n, ()):
+                    out.add(t)
+        for a in attrs:
+            if a == "__init__":
+                # `Base.__init__(self, ...)` goes up the hierarchy, never
+                # into one of our own methods; resolving it by name would
+                # make every constructor look self-recursive.
+                continue
+            for t in methods.get(a, ()):
+                out.add(t)
+        calls[qual] = out
     return defs, calls
 
 
@@ -188,8 +244,9 @@ def main(argv):
         print("FAIL: recursion is not allowed; call cycle found:")
         print("      " + " -> ".join(cycle))
         for name in cycle:
-            for path, lineno, qual in defs.get(name, []):
-                print("        %s:%d  %s" % (path, lineno, qual))
+            info = defs.get(name)
+            if info is not None:
+                print("        %s:%d  %s" % (info[0], info[1], name))
         print("summary: cycles=1 depth=unknown budget=%d" % budget)
         return 1
 

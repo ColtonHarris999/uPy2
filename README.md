@@ -53,8 +53,9 @@ and `weakref`, none of which exist at the pin.
 | `mpyc/qstrs.py` + `qstrtable.py` — static qstr pool | **done and verified against the oracle** |
 | `mpyc/tokens.py` + `lexer.py` — tokenizer | **done except t-strings; 2187 files token-exact** |
 | `mpyc/grammar.py` — grammar tables | **done; numbering confirmed against the C enum** |
-| parser engine + constant folding | in progress |
-| scope analysis, emitter | not started |
+| `mpyc/parser.py` — engine + constant folding | **done except t-strings; 2172 files tree-exact** |
+| scope analysis | next |
+| emitter | not started |
 
 **Container codec: 2083 / 2083 files byte-exact** against the pinned
 `mpy-cross`, over MicroPython's own `tests/`, `lib/micropython-lib`, `tools/`
@@ -205,13 +206,22 @@ So `MICROPY_COMP_CONST`, `MICROPY_COMP_CONST_TUPLE` and
 `MICROPY_COMP_CONST_FOLDING` are all live and have to be ported with the
 engine.
 
-**A host/target divergence to expect here:** the oracle runs on a 64-bit host,
-where a parse node's small-int leaf holds up to 2^62, so `1 << 40` folds into
-a *leaf*. On the 32-bit target — and in our `array('i')` arena — the same value
-exceeds the 31-bit small int and must become a `const_object` instead. Both
-emit the same `.mpy`, since the container records `small_int_bits = 31` either
-way, but parse-tree comparison against the oracle needs to normalise integers
-outside the 31-bit range rather than treat the difference as a bug.
+**Correction.** An earlier note here claimed a host/target divergence on
+integer size — that `1 << 40` folds to a small-int leaf on the 64-bit oracle
+but must become a `const_object` on the 32-bit target. That was wrong, and it
+was an artifact of a misconfigured oracle: `parsedump` did not initialise
+`mp_dynamic_compiler`, which `make_node_const_object_optimised` consults.
+mpy-cross's own `main()` sets `small_int_bits = 31`, so the real tool keeps an
+integer as a leaf only if it fits the *target's* small int. With the oracle
+fixed the boundary is exact and matches our arena:
+
+| literal | parse node |
+|---|---|
+| `1073741823` (2^30−1) | small-int leaf |
+| `1073741824` (2^30) | `const_object` |
+| `1 << 40` | `const_object` |
+
+There is no divergence to normalise.
 
 ## Running the checks
 
@@ -234,3 +244,65 @@ micropython tests/selftest_device.py *.mpy
 | `tests/check_roundtrip.py` | `encode(decode(x)) == x` over a corpus, against the pinned oracle |
 | `tests/selftest_device.py` | the package running on MicroPython, with a heap watermark |
 | `tools/lint_frames.py` | static call-graph check: no cycles, depth within budget |
+
+### Parser engine
+
+`mpyc/parser.py` ports `py/parse.c`: a table-driven LL parser over an explicit
+rule stack and result stack, writing nodes into the arena. Besides parsing it
+does three things that shape the tree the compiler reads — node folding
+(`and_ident` rules with one non-null argument emit nothing), constant folding,
+and docstring discarding (with `MICROPY_ENABLE_DOC_STRING` off, a lonely
+constant statement becomes `pass`).
+
+**Verified against the oracle over 2172 files — every node's kind, source
+line, child count and every leaf's value identical, zero mismatches.** A
+further 15 files are rejected by both implementations and 12 use t-strings.
+
+Constant folding covers arithmetic, logical short-circuiting, `not`, const
+tuples, `const()` declarations, and `math.pi`/`e`/`tau`/`inf`/`nan` via
+`MICROPY_COMP_MODULE_CONST`. `errno` and `uctypes` are absent from mpy-cross's
+build — probing the oracle leaves `errno.ENOENT` unfolded — so only `math` is
+in the table.
+
+`tests/parse_digest.py` reduces whole trees to one digest for cross-runtime
+comparison. CPython and MicroPython v1.29.0 agree:
+`files=100 nodes=15503 digest=fabb425b`.
+
+### The 64 KB budget holds
+
+Measured on MicroPython v1.29.0, parsing real micropython-lib modules:
+
+| lines | live | arena | nodes |
+|---|---|---|---|
+| 151–155 | 7.2–33.7 KB | 3.6–9.9 KB | 205–649 |
+| 249–267 | 7.8–19.5 KB | 6.9–13.4 KB | 378–781 |
+
+**Live** is what survives a collect with the tree still held — the figure that
+has to last across all four compiler passes. Worst case so far is 33.7 KB
+against the 64 KB budget, on a 64-bit build, so a 32-bit target should be
+lower still for the pointer-heavy parts.
+
+The distinction matters: measured *without* collecting, the same parses look
+like 0.3–1.8 MB, because that counts every transient allocation. That churn is
+real but it is a GC-pressure and speed concern, not a budget violation. It is
+the obvious next optimisation if on-device parse time disappoints — the
+per-node `children` list and the constant-key tuples are the main sources.
+
+### An open decision: which qstr pool?
+
+A string literal longer than 10 bytes becomes a qstr leaf only if an equal
+string **is already interned**, and a constant object otherwise — and those
+compile to different bytecode. So the result depends on the full qstr pool of
+whichever build does the compiling, not just the portable 166 static qstrs.
+
+mpy-cross's pool holds 582 entries; the unix firmware's holds 773. They agree
+on the first 168 and diverge after. So for `'__contains__'`, mpy-cross emits a
+qstr leaf while a build without it in its pool would emit a constant object.
+
+`tools/gen_qstr_pool.py` generates this set, defaulting to mpy-cross's build
+because mpy-cross is the designated byte-exact oracle, and `QstrPool` takes it
+as a parameter. **But a compiler running on your silicon should be handed your
+firmware's pool, not mpy-cross's** — otherwise on-device compilation of the
+same source can differ from what mpy-cross produces. Worth deciding
+explicitly: match the oracle, match the device, or make it a build-time
+input.

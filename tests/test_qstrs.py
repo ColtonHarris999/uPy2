@@ -195,7 +195,10 @@ def test_memory():
     """Report what the pool costs, since it is a constant bite of the budget."""
     try:
         import gc
-    except ImportError:
+        gc.mem_free
+    except (ImportError, AttributeError):
+        # CPython's gc has no mem_free; this measurement is MicroPython-only.
+        print("pool memory: (skipped, no gc.mem_free)")
         return
     gc.collect()
     before = gc.mem_free()

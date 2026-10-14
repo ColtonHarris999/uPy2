@@ -38,6 +38,7 @@
 #include "py/parse.h"
 #include "py/runtime.h"
 #include "py/stackctrl.h"
+#include "py/persistentcode.h"
 
 
 /* Rebuild the rule enum exactly as py/parse.c and py/compile.c do, so
@@ -60,6 +61,52 @@ enum {
 };
 
 static long heap_size = 64 * 1024 * 1024;
+
+/* Render one constant object unambiguously: a type tag, then a payload that
+ * survives comparison -- raw hex for text, %.17g for floats. */
+static void print_const(mp_obj_t o) {
+    if (o == mp_const_none) {
+        printf("none");
+    } else if (o == mp_const_true) {
+        printf("true");
+    } else if (o == mp_const_false) {
+        printf("false");
+    } else if (mp_obj_is_type(o, &mp_type_tuple)) {
+        size_t len;
+        mp_obj_t *items;
+        mp_obj_tuple_get(o, &len, &items);
+        printf("tuple(%lu", (unsigned long)len);
+        for (size_t i = 0; i < len; ++i) {
+            printf(",");
+            print_const(items[i]);
+        }
+        printf(")");
+    } else if (mp_obj_is_str(o) || mp_obj_is_type(o, &mp_type_bytes)) {
+        size_t len;
+        const char *str = mp_obj_str_get_data(o, &len);
+        printf("%s:", mp_obj_is_str(o) ? "str" : "bytes");
+        for (size_t i = 0; i < len; ++i) {
+            printf("%02x", (unsigned char)str[i]);
+        }
+    } else if (mp_obj_is_int(o)) {
+        /* Via its decimal text, so a big int survives. */
+        vstr_t vstr;
+        mp_print_t pr;
+        vstr_init_print(&vstr, 16, &pr);
+        mp_obj_print_helper(&pr, o, PRINT_REPR);
+        printf("int:%.*s", (int)vstr_len(&vstr), vstr_str(&vstr));
+        vstr_clear(&vstr);
+    } else if (mp_obj_is_float(o)) {
+        printf("float:%.17g", (double)mp_obj_get_float(o));
+    } else {
+        vstr_t vstr;
+        mp_print_t pr;
+        vstr_init_print(&vstr, 16, &pr);
+        mp_obj_print_helper(&pr, o, PRINT_REPR);
+        printf("other:%.*s", (int)vstr_len(&vstr), vstr_str(&vstr));
+        vstr_clear(&vstr);
+    }
+}
 
 /* Walk the tree iteratively: an input-shaped recursion could overflow the C
  * stack on deeply nested source, and we want this to survive what we feed it. */
@@ -99,22 +146,25 @@ static void dump(mp_parse_node_t root) {
             continue;
         }
         if (MP_PARSE_NODE_IS_LEAF(pn)) {
-            const char *what = "?";
-            switch (MP_PARSE_NODE_LEAF_KIND(pn)) {
-                case MP_PARSE_NODE_ID:
-                    what = "id";
-                    break;
-                case MP_PARSE_NODE_STRING:
-                    what = "str";
-                    break;
-                case MP_PARSE_NODE_TOKEN:
-                    what = "tok";
-                    break;
-                default:
-                    break;
+            size_t lk = MP_PARSE_NODE_LEAF_KIND(pn);
+            unsigned long arg = (unsigned long)MP_PARSE_NODE_LEAF_ARG(pn);
+            if (lk == MP_PARSE_NODE_ID || lk == MP_PARSE_NODE_STRING) {
+                /* Print the qstr's TEXT, not its number: dynamic qstr numbers
+                 * depend on how many the build already had, so only the text
+                 * is comparable against our own pool. */
+                size_t len;
+                const byte *str = qstr_data((qstr)arg, &len);
+                printf("L\t%d\t%s\t", depth,
+                    lk == MP_PARSE_NODE_ID ? "id" : "str");
+                for (size_t i = 0; i < len; ++i) {
+                    printf("%02x", str[i]);
+                }
+                printf("\n");
+            } else if (lk == MP_PARSE_NODE_TOKEN) {
+                printf("L\t%d\ttok\t%lu\n", depth, arg);
+            } else {
+                printf("L\t%d\t?\t%lu\n", depth, arg);
             }
-            printf("L\t%d\t%s\t%lu\n", depth, what,
-                (unsigned long)MP_PARSE_NODE_LEAF_ARG(pn));
             continue;
         }
 
@@ -123,18 +173,14 @@ static void dump(mp_parse_node_t root) {
         size_t kind = MP_PARSE_NODE_STRUCT_KIND(pns);
 
         if (kind == RULE_const_object) {
-            /* Folded constant: the slots hold an object, not parse nodes. */
-            vstr_t vstr;
-            mp_print_t pr;
-            vstr_init_print(&vstr, 16, &pr);
-            mp_obj_print_helper(&pr, mp_parse_node_extract_const_object(pns),
-                PRINT_REPR);
+            /* Folded constant: the slots hold an object, not parse nodes.
+             * Print a structured form, not repr: MicroPython's float printer
+             * is not shortest-round-trip, and a str is a byte sequence that
+             * repr would render lossily.  Strings and bytes go out as raw
+             * hex, floats as %.17g, so comparison is exact. */
             printf("C\t%d\t%lu\t", depth, (unsigned long)pns->source_line);
-            for (size_t i = 0; i < vstr_len(&vstr); ++i) {
-                printf("%02x", (unsigned char)vstr_str(&vstr)[i]);
-            }
+            print_const(mp_parse_node_extract_const_object(pns));
             printf("\n");
-            vstr_clear(&vstr);
             continue;
         }
 
@@ -179,6 +225,17 @@ int main(int argc, char **argv) {
     char *heap = malloc(heap_size);
     gc_init(heap, heap + heap_size);
     mp_init();
+
+    /* mpy-cross's main() configures the dynamic compiler before compiling, and
+     * the parser reads it: make_node_const_object_optimised() keeps an integer
+     * as a small-int parse leaf only if it fits the TARGET's small int.  Leave
+     * this unset and large integers wrongly stay leaves on a 64-bit host, which
+     * is not what the real tool does.  Same values as mpy-cross. */
+    mp_dynamic_compiler.small_int_bits = 31;
+    mp_dynamic_compiler.native_arch = MP_NATIVE_ARCH_NONE;
+    mp_dynamic_compiler.nlr_buf_num_regs = 0;
+    mp_dynamic_compiler.backend_options = NULL;
+    mp_dynamic_compiler.include_source_lines = 1;
 
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
