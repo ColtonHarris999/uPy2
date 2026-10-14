@@ -48,6 +48,15 @@ class NotImplementedFeature(LexerError):
     """A construct the C lexer implements but this port does not yet."""
 
 
+class NotImplementedByMicroPython(LexerError):
+    """A construct the *pinned MicroPython* does not implement either.
+
+    Raising here is the port being faithful rather than a gap: ``py/lexer.c``
+    calls ``mp_raise_NotImplementedError`` at the same point, with the same
+    message, and ``mpy-cross`` exits non-zero on such a file.
+    """
+
+
 # -- character classes ----------------------------------------------------
 #
 # MicroPython's unichar_* helpers are ASCII-only; bytes >= 0x80 are admitted
@@ -319,10 +328,6 @@ class Lexer:
         return True, num
 
     def _parse_string_literal(self, is_raw, is_fstring, is_tstring):
-        if is_tstring:
-            raise NotImplementedFeature(
-                "t-string interpolation is not implemented yet")
-
         quote_char = 0x27
         if self._is_char(0x22):
             quote_char = 0x22
@@ -339,47 +344,119 @@ class Lexer:
             # Adjacent f-strings share one .format() call, so only open it
             # when this is the first.
             self.fstring_args.extend(b".format(")
+        if is_tstring and len(self.fstring_args) == 0:
+            # A t-string becomes a call whose first argument is the tuple of
+            # literal pieces, so open both the tuple and its first piece.
+            self.vstr.append(0x28)  # '('
+            self.vstr.append(0x28)  # '('
+            for _ in range(num_quotes):
+                self.vstr.append(quote_char)
+
+        # Per-literal t-string state.  _tstr_nest is the brace depth inside a
+        # format spec, counted so that a spec containing braces of its own --
+        # which is a nested f-string -- is passed through whole.
+        self._tstr_nest = 0
+        self._tstr_fmt_index = 0
+        self._tstr_needs_f = False
+        interpolations = 0
 
         n_closing = 0
         vstr = self.vstr
+        args = self.fstring_args
         while (not self._is_end()
                and (num_quotes > 1 or self.chr0 != 0x0A)
                and n_closing < num_quotes):
             if self._is_char(quote_char):
                 n_closing += 1
                 vstr.append(self.chr0)
+            elif is_tstring and self._is_char(0x0A):
+                # A multi-line t-string is re-lexed as a single-quoted
+                # string, so its newlines go in as escapes.
+                vstr.append(0x5C)
+                vstr.append(0x6E)  # 'n'
             else:
                 n_closing = 0
-                if is_fstring and self._is_char(0x7B):  # '{'
-                    if self._parse_fstring_arg(quote_char):
+                if (is_fstring or is_tstring) and self._is_char(0x7B):  # '{'
+                    if not self._tstr_nest:
+                        self._parse_fstring_arg(quote_char, is_tstring,
+                                                num_quotes)
                         continue
-                elif self._is_char(0x5C):  # backslash
+                    # Inside a format spec: count the brace and let the plain
+                    # character handling below copy it.
+                    self._tstr_nest += 1
+
+                if is_tstring and self._is_char(0x5C):  # backslash
+                    # Left for the re-lex to interpret, so the escape is
+                    # copied rather than resolved.
+                    vstr.append(0x5C)
+                    if is_raw:
+                        vstr.append(0x5C)
+                    else:
+                        self._next_char()
+                        vstr.append(self.chr0)
+                elif self._is_char(0x5C):
                     if self._parse_escape(is_raw, vstr):
                         continue
+                elif (is_tstring and self._tstr_nest
+                        and self._is_char(0x7D)):  # '}'
+                    self._tstr_nest -= 1
+                    if self._tstr_nest > 0:
+                        self._tstr_needs_f = True
+                        vstr.append(self.chr0)
+                    else:
+                        # The interpolation is complete: move the format spec
+                        # out of the literal piece and into the argument list.
+                        interpolations += 1
+                        if self._tstr_needs_f:
+                            args.append(0x66)  # 'f'
+                            self._tstr_needs_f = False
+                        args.append(quote_char)
+                        args.extend(vstr[self._tstr_fmt_index + 1:])
+                        vstr[self._tstr_fmt_index:] = b""
+                        args.append(quote_char)
+                        args.append(0x2C)  # ','
                 else:
                     vstr.append(self.chr0)
+                    if is_tstring and self.chr0 == 0x7D:
+                        if self.chr1 == 0x7D:
+                            self._next_char()   # '}}' is one '}'
+                        else:
+                            self.tok_kind = MP_TOKEN_MALFORMED_FSTRING
             self._next_char()
 
         if n_closing < num_quotes:
             self.tok_kind = MP_TOKEN_LONELY_STRING_OPEN
+
+        if is_tstring:
+            if self._tstr_nest > 0:
+                self.tok_kind = MP_TOKEN_MALFORMED_FSTRING
+            if 1 + interpolations * 4 > 255:
+                # More arguments than a call can take, so pass the
+                # interpolations as one tuple instead.
+                args[0:0] = b"("
+                args.append(0x29)  # ')'
+            # The quotes stay: this text is going to be re-lexed.
+            return
 
         # Drop the closing quotes from the token text.  MicroPython's
         # bytearray has no item deletion, so truncate by slice assignment.
         if n_closing:
             vstr[len(vstr) - n_closing:] = b""
 
-    def _parse_fstring_arg(self, quote_char):
-        """Handle a ``{`` inside an f-string.
+    def _parse_fstring_arg(self, quote_char, is_tstring, num_quotes):
+        """Handle a ``{`` inside an f-string or t-string.
 
-        Returns True if the caller should continue its loop without the
-        trailing ``next_char`` (matching the C ``goto continue_outer``).
+        The caller continues its loop without the trailing ``next_char``,
+        matching the C ``goto continue_outer``.
         """
         self._next_char()
-        if self._is_char(0x7B):  # '{{' passes through to str.format
-            self.vstr.append(0x7B)
+        if self._is_char(0x7B):  # '{{'
+            if not is_tstring:
+                # passes through to str.format
+                self.vstr.append(0x7B)
             self._next_char()
             self.vstr.append(0x7B)
-            return True
+            return
 
         args = self.fstring_args
         args.append(0x28)  # '('
@@ -405,10 +482,18 @@ class Lexer:
             args.append(c)
             self._next_char()
 
+        was_debug = False
         if len(args) and args[len(args) - 1] == 0x3D:  # '='
             # f'{a=}' keeps the expression text in the format string.
             self.vstr.extend(args[start:])
             args[len(args) - 1:] = b""
+            was_debug = True
+
+        if is_tstring:
+            # The expression text becomes a string literal, so trailing
+            # whitespace would show up in it.
+            while len(args) and _is_space(args[len(args) - 1]):
+                args[len(args) - 1:] = b""
 
         if len(args) == start:
             # empty interpolation, eg f'{}'
@@ -416,8 +501,49 @@ class Lexer:
 
         args.append(0x29)  # ')'
         args.append(0x2C)  # ','
-        self.vstr.append(0x7B)
-        return True
+
+        if is_tstring:
+            # Each interpolation contributes four arguments: its value, its
+            # source text, its conversion and its format spec.  The value is
+            # already in; the source text is the same characters quoted.
+            args.append(quote_char)
+            n = len(args) - start - 3
+            for j in range(n):
+                b = args[start + j]
+                if b == quote_char or b == 0x5C:
+                    args.append(0x5C)
+                args.append(b)
+            args.append(quote_char)
+            args.append(0x2C)
+
+            # End this literal piece and start the next one.
+            for _ in range(num_quotes):
+                self.vstr.append(quote_char)
+            self.vstr.append(0x2C)  # ','
+            for _ in range(num_quotes):
+                self.vstr.append(quote_char)
+
+            if self._is_char(0x21):  # '!r' or '!s'
+                self._next_char()
+                args.append(quote_char)
+                args.append(self.chr0)
+                self._next_char()
+                args.append(quote_char)
+                args.append(0x2C)
+            elif was_debug and not self._is_char(0x3A):
+                # t'{a=}' repeats the value with repr, as f'{a=}' does.
+                args.extend(b"'r',")
+            else:
+                args.extend(b"None,")
+
+            if self._is_char(0x3A):  # ':'
+                self._next_char()
+            # From here to the closing '}' is the format spec, accumulated in
+            # vstr and moved into args when that '}' arrives.
+            self._tstr_nest = 1
+            self._tstr_fmt_index = len(self.vstr)
+
+        self.vstr.append(0x7B)  # '{'
 
     def _parse_escape(self, is_raw, vstr):
         """Handle a backslash in a string.  Returns True to skip the
@@ -449,7 +575,9 @@ class Lexer:
                     self._emit_escaped(c, vstr)
                     return False
             elif c == 0x4E:  # '\N{...}'
-                raise NotImplementedFeature("unicode name escapes")
+                # '\N{LATIN SMALL LETTER A}' would need the whole Unicode
+                # name table in the core, which py/lexer.c declines to carry.
+                raise NotImplementedByMicroPython("unicode name escapes")
             elif 0x30 <= c <= 0x37:  # octal, 1-3 digits
                 digits = 3
                 num = c - 0x30
@@ -486,6 +614,7 @@ class Lexer:
         """
         # MP_TOKEN_END marks "no literal seen yet".
         self.tok_kind = MP_TOKEN_END
+        had_tstring = False
         while True:
             is_raw = False
             is_fstring = False
@@ -526,6 +655,9 @@ class Lexer:
                     is_raw = True
                     n_char = 2
 
+            if is_tstring:
+                had_tstring = True
+
             if self.tok_kind == MP_TOKEN_END:
                 self.tok_kind = kind
             elif self.tok_kind != kind:
@@ -541,6 +673,20 @@ class Lexer:
             self._skip_whitespace(True)
             if not self._is_string_or_bytes():
                 break
+
+        if had_tstring:
+            # Close the tuple of literal pieces and put it in front of the
+            # interpolations, so the whole thing reads as the argument list of
+            # a call: __template__(("a", "b",), (x), 'x', None, "",).  The
+            # token itself becomes that callable's name, and the arguments are
+            # spliced into the input below.
+            self.vstr.append(0x2C)  # ','
+            self.vstr.append(0x29)  # ')'
+            self.vstr.append(0x2C)  # ','
+            self.fstring_args[0:0] = self.vstr
+            if self.tok_kind > MP_TOKEN_MALFORMED_FSTRING:
+                self.tok_kind = MP_TOKEN_NAME
+                self.vstr = bytearray(b"__template__")
 
         if len(self.fstring_args):
             # The f-string is complete: splice ".format(...)" into the input

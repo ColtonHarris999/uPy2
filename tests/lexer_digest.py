@@ -7,7 +7,12 @@ v1.29.0 and the two numbers compared directly.  Any divergence in kind, line,
 column or text changes the digest.
 
     python3 tests/lexer_digest.py FILE.py...
-    micropython tests/lexer_digest.py FILE.py...
+    micropython -X heapsize=256M tests/lexer_digest.py FILE.py...
+
+A corpus of several hundred files held in one process needs far more heap
+than one module does, and the unix port's default heap is small; raise it,
+or a MemoryError on a large file will read as a difference between the
+runtimes.
 """
 import sys
 sys.path.insert(0, ".")

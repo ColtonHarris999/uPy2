@@ -135,6 +135,16 @@ places at once *and* where the walker now reaches the second one first; the
 places where C emits code before noticing are queued behind that code (the
 `W_ERROR` work item) so the order is preserved.
 
+## Not a deviation: `\N{...}` escapes are refused
+
+`py/lexer.c` calls `mp_raise_NotImplementedError("unicode name escapes")`
+rather than carry the 3 MB Unicode name table, and `mpy-cross` exits non-zero
+on such a file. The lexer here raises `NotImplementedByMicroPython` with the
+same message, which is a different exception class from
+`NotImplementedFeature` precisely so that a faithful refusal is not counted as
+a gap in the port. `tests/cpydiff/syntax_unicode_nameesc.py` is the one corpus
+file that exercises it, and it is counted as "rejected by both".
+
 ## Non-deviations worth recording
 
 These look like candidates and are not.

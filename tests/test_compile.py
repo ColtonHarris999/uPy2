@@ -33,7 +33,8 @@ from mpyc import compile as C  # noqa: E402
 from mpyc import mpy_format as MPY  # noqa: E402
 from mpyc import parser as P  # noqa: E402
 from mpyc import qstrtable  # noqa: E402
-from mpyc.lexer import Lexer, NotImplementedFeature  # noqa: E402
+from mpyc.lexer import (Lexer, NotImplementedByMicroPython,  # noqa: E402
+                        NotImplementedFeature)
 
 _fails = []
 _ORACLE_POOL = []
@@ -183,7 +184,10 @@ def run_corpus(mpy_cross, roots, show):
                 compile_ours(name, src)
             except NotImplementedFeature:
                 deferred += 1
-            except (P.ParseError, C.CompileError):
+            except (P.ParseError, C.CompileError,
+                    NotImplementedByMicroPython):
+                # Rejecting it for the reason the pin itself rejects it is
+                # agreement, not a gap.
                 rejected_both += 1
             except Exception as e:  # noqa: BLE001
                 # Still a rejection, but not one we meant to make.

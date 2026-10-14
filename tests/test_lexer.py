@@ -7,18 +7,29 @@ over the same files and compares kind, line, column and text.
     python3 tests/test_lexer.py --lexdump build/lexdump PATH...
 
 Build the oracle first with tools/build_lexdump.sh.
+
+The f-string and t-string rewrites also get an oracle-free check, since
+those are the one place the lexer rewrites its input rather than reporting
+it, and the expected text is short enough to write down.
 """
 import os
-import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+# Plain relative entries, as the other device-runnable tests use: MicroPython
+# has no os.path.
+sys.path.insert(0, ".")
+sys.path.insert(0, "..")
 from mpyc import lexer as L  # noqa: E402
 from mpyc import tokens as T  # noqa: E402
 
 
 def oracle_tokens(lexdump, path):
-    """[(kind, line, column, text_bytes)] from the C lexer, or ('E', msg)."""
+    """[(kind, line, column, text_bytes)] from the C lexer, or ('E', msg).
+
+    ``subprocess`` is imported here rather than at the top so the rewrite
+    checks below, which need no oracle, can run under MicroPython too.
+    """
+    import subprocess
     p = subprocess.run([lexdump, path], capture_output=True)
     out = p.stdout.decode("utf-8", "replace")
     toks = []
@@ -94,6 +105,66 @@ def iter_files(paths):
             yield p
 
 
+# What the lexer rewrites each literal into: the text of the token it
+# produces, then the source it splices in behind it.  Every line here was
+# confirmed token-exact against the C oracle on that same input, so these are
+# py/lexer.c's rewrites and not a guess at them; they are written down because
+# the rewrite is the one thing the lexer does that reading the resulting token
+# stream does not make obvious.
+REWRITES = (
+    # An f-string becomes a .format() call: the placeholders stay in the
+    # literal for str.format to fill, and each expression is wrapped in
+    # parentheses so a comma inside it stays one argument.
+    ('f"a{x}b"', 'a{}b', '.format((x),)'),
+    ('f"{x}{y}"', '{}{}', '.format((x),(y),)'),
+    ('f"{x=}"', 'x={}', '.format((x),)'),
+    # Even with nothing to interpolate: "{{" is str.format's escape, so the
+    # call has to happen for it to be unescaped.
+    ('f"{{literal}}"', '{{literal}}', '.format()'),
+    # A t-string becomes a __template__ call: the literal pieces as one
+    # tuple, then four arguments per interpolation -- the value, the source
+    # text of the expression, the conversion, and the format spec.
+    ('t"abc"', '__template__', '(("abc",),)'),
+    ('t"a{x}b"', '__template__', '(("a","b",),(x),"x",None,"",)'),
+    ('t"{x!r}"', '__template__', '(("","",),(x),"x","r","",)'),
+    ('t"{x:>10}"', '__template__', '(("","",),(x),"x",None,">10",)'),
+    # t'{x=}' repeats the expression in the literal and asks for repr.
+    ('t"{x=}"', '__template__', '(("x=","",),(x),"x",\'r\',"",)'),
+    # A format spec with braces of its own is handed over as an f-string, to
+    # be expanded when this text is re-lexed.
+    ('t"{x:>{w}}"', '__template__', '(("","",),(x),"x",None,f">{w}",)'),
+    # "{{" is one brace here too, but a t-string unescapes it itself.
+    ('t"a{{b}}c"', '__template__', '(("a{b}c",),)'),
+)
+
+
+def test_rewrites():
+    """Each literal's first token, and the text spliced in after it."""
+    bad = 0
+    for src, first_text, injected in REWRITES:
+        lex = L.Lexer("t.py", src)
+        got_first = bytes(lex.vstr).decode("utf-8", "replace")
+        if got_first != first_text:
+            print("FAIL %s: first token is %r, expected %r"
+                  % (src, got_first, first_text))
+            bad += 1
+        if injected is not None:
+            got = bytes(lex.inject_chrs[:lex.inject_chrs_idx or None])
+            # The injected text sits in the buffer ahead of the three-byte
+            # lookahead window the lexer rewound into it.
+            text = bytes(lex.inject_chrs).decode("utf-8", "replace")
+            if lex.inject_chrs_idx >= 3:
+                text = text[lex.inject_chrs_idx - 3:]
+            # Drop the rewound window, which is the source after the literal.
+            text = text[:len(text) - 3] if len(text) >= 3 else text
+            if text != injected:
+                print("FAIL %s: injected %r, expected %r"
+                      % (src, text, injected))
+                bad += 1
+    print("rewrites: %d literals, %d failures" % (len(REWRITES), bad))
+    return bad
+
+
 def main(argv):
     lexdump = None
     paths = []
@@ -109,12 +180,19 @@ def main(argv):
             show = int(next(it))
         else:
             paths.append(a)
+    if not paths:
+        # The rewrite checks need no oracle and no os.path, so they run
+        # anywhere, including on the device.
+        return 1 if test_rewrites() else 0
     if lexdump is None:
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         lexdump = os.path.join(here, "build", "lexdump")
     if not os.path.exists(lexdump):
-        print("ERROR: no oracle at %s -- run tools/build_lexdump.sh" % lexdump)
+        print("ERROR: no oracle at %s -- run tools/build_lexdump.sh"
+              % lexdump)
         return 2
+
+    bad_rewrites = test_rewrites()
 
     counts = {}
     shown = 0
@@ -133,7 +211,7 @@ def main(argv):
     print("summary: " + " ".join("%s=%d" % kv for kv in sorted(counts.items())))
     bad = sum(v for k, v in counts.items()
               if k not in ("ok", "both-error", "not-implemented"))
-    return 1 if bad else 0
+    return 1 if bad or bad_rewrites else 0
 
 
 if __name__ == "__main__":

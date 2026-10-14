@@ -51,21 +51,21 @@ and `weakref`, none of which exist at the pin.
 | `mpyc/mpy_format.py` — `.mpy` container codec | **done and verified** |
 | `mpyc/parsetree.py` — packed parse tree | **done; memory budget cleared** |
 | `mpyc/qstrs.py` + `qstrtable.py` — static qstr pool | **done and verified against the oracle** |
-| `mpyc/tokens.py` + `lexer.py` — tokenizer | **done except t-strings; 2187 files token-exact** |
+| `mpyc/tokens.py` + `lexer.py` — tokenizer | **done; 2268 files token-exact** |
 | `mpyc/grammar.py` — grammar tables | **done; numbering confirmed against the C enum** |
-| `mpyc/parser.py` — engine + constant folding | **done except t-strings; 2172 files tree-exact** |
+| `mpyc/parser.py` — engine + constant folding | **done; 2253 files tree-exact** |
 | `mpyc/scope.py` — scope and identifier analysis | **done; identifier table packed into `array('i')`** |
 | `mpyc/opcodes.py` + `bytecode.py` — opcodes, prelude, instructions | **done; 462296 instructions round-trip** |
 | `mpyc/emitbc.py` — the emitter state machine | **done** |
-| `mpyc/compile.py` — the compiler walker | **done except t-strings; 2137 files byte-exact end to end** |
+| `mpyc/compile.py` — the compiler walker | **done; 2148 files byte-exact end to end** |
 
-**End to end: 2137 / 2138 files compile byte-for-byte** into the same `.mpy`
+**End to end: 2148 / 2149 files compile byte-for-byte** into the same `.mpy`
 `mpy-cross` v1.29.0 produces, over MicroPython's own `tests/`, `tools/`,
 `examples/` and `lib/` trees. The one remaining file differs only in how a
 float constant is spelled, and the two spellings read back as the same double
-(DEVIATIONS.md, D2). 119 further files are rejected by the oracle itself and
-are rejected here too — **nothing the oracle refuses is accepted**. 12 files
-use t-string interpolation, which the lexer does not implement yet.
+(DEVIATIONS.md, D2). 120 further files are rejected by the oracle itself and
+are rejected here too — **nothing the oracle refuses is accepted**, and
+nothing is left deferred.
 
 **Container codec: 2083 / 2083 files byte-exact** against the pinned
 `mpy-cross`, over MicroPython's own `tests/`, `lib/micropython-lib`, `tools/`
@@ -159,9 +159,11 @@ input and re-lexed, so the parser never learns f-strings exist. That also
 means the mechanism is unaware of Python syntax and cannot handle an
 expression containing `}` or `:` — a limitation to reproduce, not fix.
 
-**Verified against the oracle over 2187 files — every token's kind, line,
+**Verified against the oracle over 2268 files — every token's kind, line,
 column and text identical, zero mismatches.** Corpus: MicroPython's `tests/`,
-`lib/micropython-lib`, `tools/` and `py/` trees.
+`lib/micropython-lib`, `tools/`, `examples/` and `py/` trees. The one
+remaining file of 2269 is refused by both implementations, for the same
+reason (see below).
 
 The oracle is `tools/lexdump.c`, which links the real `py/lexer.c` out of the
 pinned mpy-cross build and prints its token stream; build it with
@@ -173,9 +175,11 @@ so the same corpus can be run under both runtimes and compared where
 subprocess is unavailable. CPython and MicroPython v1.29.0 agree:
 `files=120 tokens=18565 digest=45dda7d0`.
 
-**Not yet done:** t-string interpolation (12 corpus files), which raises
-`NotImplementedFeature` rather than lexing wrongly. `\N{...}` unicode name
-escapes raise, matching the C lexer.
+`\N{...}` unicode name escapes raise `NotImplementedByMicroPython`, because
+`py/lexer.c` raises `NotImplementedError` at the same point rather than carry
+the Unicode name table; `mpy-cross` refuses such a file too. That is a
+separate exception class from `NotImplementedFeature` precisely so a faithful
+refusal cannot be mistaken for a gap in the port — there are no gaps left.
 
 ### Grammar tables and the parse-tree oracle
 
@@ -281,9 +285,9 @@ does three things that shape the tree the compiler reads — node folding
 and docstring discarding (with `MICROPY_ENABLE_DOC_STRING` off, a lonely
 constant statement becomes `pass`).
 
-**Verified against the oracle over 2172 files — every node's kind, source
-line, child count and every leaf's value identical, zero mismatches.** A
-further 15 files are rejected by both implementations and 12 use t-strings.
+**Verified against the oracle over 2253 files — every node's kind, source
+line, child count and every leaf's value identical, zero mismatches.** The
+other 16 files of 2269 are rejected by both implementations.
 
 Constant folding covers arithmetic, logical short-circuiting, `not`, const
 tuples, `const()` declarations, and `math.pi`/`e`/`tau`/`inf`/`nan` via
@@ -333,13 +337,13 @@ against. `mpyc/qstr_pool.py` is generated from a firmware build by
 
 The accepted consequence: **mpy-cross is no longer a byte-exact oracle for
 every file.** The two pools are not nested — 465 entries are only in the unix
-build's, 274 only in mpy-cross's — and over the 2172-file corpus **42 files
-(1.9%) parse to different trees** depending on which pool is used
+build's, 274 only in mpy-cross's — and over the corpus **42 files (1.9%)
+parse to different trees** depending on which pool is used
 (`tests/basics/fun_globals.py`, `tests/extmod/framebuf1.py`, …).
 
 So the differential tests hand the parser *mpy-cross's* pool
 (`tests/oracle_qstr_pool.py`), which keeps them checking the engine rather
-than the pool choice; on that footing the corpus is still 2172 exact. What
+than the pool choice; on that footing the corpus is exact. What
 they no longer prove is that on-device output matches mpy-cross byte for byte
 on those 42 files — by design, since matching the device is what was asked
 for. Validating those needs the device's own compiler as the reference, which
@@ -520,6 +524,24 @@ Roughly a 10 KB baseline plus 0.22 KB per line, so a 200-line module is about
 pointer, every list slot and every dictionary entry is twice the target's
 width, so this is an upper bound rather than the figure.
 
+**t-strings cost more.** Each one expands in the lexer into several times its
+own length of source, which is then re-lexed, so a t-string-dense module
+carries more tokens, more nodes and more qstrs per line. Measured on
+MicroPython's own `string_tstring_basic.py`, truncated to length:
+
+| lines | live | churn |
+|---|---|---|
+| 86 | 52.6 KB | 2.6 MB |
+| 171 | 74.8 KB | 5.4 MB |
+| 340 | 137.7 KB | 9.8 MB |
+
+Linear in both, so there is no hidden quadratic in the rewrite — it is simply
+about 1.5× the per-line cost of ordinary code, on top of a larger baseline.
+A 200-line module of that density would be around 80 KB on the 64-bit build.
+It also means the unix port's *default* heap is not enough to hold a corpus of
+such files in one process, which is why the digest tests want
+`-X heapsize=...`; that is a limit of the test harness, not of a compile.
+
 Getting there took three measured fixes, each of which is in the code as a
 comment:
 
@@ -533,10 +555,10 @@ comment:
 
 | check | result |
 |---|---|
-| byte-exact against `mpy-cross` v1.29.0 | **2137 / 2138 files** |
+| byte-exact against `mpy-cross` v1.29.0 | **2148 / 2149 files** |
 | functions emitted | 10337, 466380 instructions, **207 distinct opcode values** |
 | the one exception | a float constant spelled differently, same value (D2) |
-| rejected by the oracle, rejected here | **119 / 119** |
+| rejected by the oracle, rejected here | **120 / 120** |
 | accepted here but rejected by the oracle | **0** |
 | crashes | **0** |
 | the same files under CPython and MicroPython v1.29.0 | **identical, all of them** |
@@ -616,3 +638,46 @@ including why matching the oracle's rounding is not worth wanting: a 32-bit
 target compiles `MICROPY_FLOAT_FORMAT_IMPL_APPROX` rather than `..._EXACT`,
 and those two were built and measured at the pin as disagreeing on **2290 of
 5631 doubles**.
+
+### t-strings
+
+A t-string is rewritten in the lexer, as an f-string is, but into a different
+shape. `py/lexer.c` turns `f"a{x}b"` into `"a{}b".format((x),)` and splices
+that text back into its own input; a t-string instead becomes a call to
+`__template__` whose first argument is the tuple of literal pieces and whose
+remaining arguments come four at a time, one group per interpolation:
+
+| source | rewritten to |
+|---|---|
+| `t"abc"` | `__template__(("abc",),)` |
+| `t"a{x}b"` | `__template__(("a","b",),(x),"x",None,"",)` |
+| `t"{x!r}"` | `__template__(("","",),(x),"x","r","",)` |
+| `t"{x:>10}"` | `__template__(("","",),(x),"x",None,">10",)` |
+| `t"{x=}"` | `__template__(("x=","",),(x),"x",'r',"",)` |
+| `t"{x:>{w}}"` | `__template__(("","",),(x),"x",None,f">{w}",)` |
+
+The four arguments are the value, the source text of the expression, the
+conversion, and the format spec. The last row is the interesting one: a format
+spec containing braces of its own is handed back as an *f-string*, to be
+expanded when the spliced text is re-lexed — so the rewrite can recurse one
+level through the lexer's own input. A t-string also differs from an f-string
+in unescaping `{{` and `}}` itself rather than leaving them for `str.format`,
+in passing backslash escapes through unresolved (the text is going to be
+re-lexed), and in keeping its quotes rather than cutting them off.
+
+With more than 63 interpolations the call would exceed the 255-argument limit,
+so they are wrapped in one tuple instead — a case worth having in the table
+below, since nothing in the corpus reaches it.
+
+Verified at all three levels against the oracle: **token-exact, tree-exact and
+byte-exact** on MicroPython's eleven `string_tstring_*` tests plus 59
+hand-written cases covering adjacency, raw and triple-quoted forms, multi-line
+t-strings, nested format specs, `{{`/`}}`, debug `=`, conversions, quotes
+inside the expression, 70 interpolations, and nine malformed forms. The
+malformed ones produce the oracle's message verbatim (`malformed f-string`,
+`invalid syntax`), and nothing the oracle refuses is accepted.
+
+`tests/test_lexer.py` run with no arguments checks those rewrites without the
+oracle, and so runs on the device too. Each expectation in it was confirmed
+token-exact against `py/lexer.c` on the same input first — the table records
+what the C lexer does, rather than a guess at it.

@@ -5,7 +5,12 @@ lacks.  This reduces whole trees to one order-sensitive digest so the same
 files can run under CPython and MicroPython v1.29.0 and be compared directly.
 
     python3 tests/parse_digest.py FILE.py...
-    micropython tests/parse_digest.py FILE.py...
+    micropython -X heapsize=256M tests/parse_digest.py FILE.py...
+
+A corpus of several hundred files held in one process needs far more heap
+than one module does, and the unix port's default heap is small; raise it,
+or a MemoryError on a large file will read as a difference between the
+runtimes.
 """
 import sys
 
