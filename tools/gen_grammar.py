@@ -144,6 +144,14 @@ def encode_arg(text, rule_index, tokens):
     raise SystemExit("unknown rule argument %r" % text)
 
 
+def comp_name(text):
+    """The handler name inside a DEF_RULE's ``c(...)`` second field."""
+    m = re.match(r"^c\((\w+)\)$", text)
+    if not m:
+        raise SystemExit("unexpected compile function %r" % text)
+    return m.group(1)
+
+
 def render(rules, order, rule_index, tokens, tree_root, flags):
     acts = []
     args_flat = []
@@ -204,6 +212,18 @@ def render(rules, order, rule_index, tokens, tree_root, flags):
     w("RULE_NAMES = (")
     for name in order:
         w("    %r," % (name if name == "RULE_const_object" else name))
+    w(")")
+    w("")
+    w("# The compile function each rule's nodes are walked by, from the")
+    w("# DEF_RULE's second field.  The walker builds its dispatch table from")
+    w("# these names, so a rule renamed upstream fails loudly rather than")
+    w("# silently walking with the wrong handler.")
+    w("RULE_COMPILE_FN = (")
+    for name in order:
+        if name == "RULE_const_object":
+            w("    'const_object',")
+            break
+        w("    %r," % comp_name(rules[name][1]))
     w(")")
     w("")
     w("# Rules carrying a compile function come first; this is where that")

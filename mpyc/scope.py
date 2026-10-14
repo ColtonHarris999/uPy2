@@ -1,19 +1,23 @@
 """Scope and identifier analysis: a port of ``py/scope.c``.
 
 One ``Scope`` per Python block (module, class, function, lambda, each kind of
-comprehension).  Each holds an ordered list of ``IdInfo``, one per name the
-block mentions, and the compiler's first pass (``MP_PASS_SCOPE``) decides each
-name's kind: local, cell, free, or one of the global flavours.
+comprehension).  Each holds an ordered table of identifiers, one entry per
+name the block mentions, and the compiler's first pass (``MP_PASS_SCOPE``)
+decides each name's kind: local, cell, free, or one of the global flavours.
 
 The substantive logic is closing over variables.  When a nested block reads a
 name its parent owns, the name becomes ``FREE`` here and the chain of parents
 up to the owner is walked: the owner's ``LOCAL`` becomes ``CELL``, and every
 block in between gains a ``FREE`` entry so the value can be threaded through.
 
-Identifier order is load-bearing: ``id_info`` is kept in first-mention order,
+Identifier order is load-bearing: the table is kept in first-mention order,
 which is what decides local slot numbers, and the compiler adds a function's
-arguments before its body so they come first.
+arguments before its body so they come first.  An identifier is referred to by
+its index into that table, never by a reference to an object: the table is a
+packed ``array('i')``, for reasons the ``Scope`` docstring gives.
 """
+
+from array import array
 
 from . import qstrs
 
@@ -38,6 +42,18 @@ ID_FLAG_IS_PARAM = 0x01
 ID_FLAG_IS_STAR_PARAM = 0x02
 ID_FLAG_IS_DBL_STAR_PARAM = 0x04
 ID_FLAG_VIPER_TYPE_POS = 4
+
+# -- the packed identifier table -----------------------------------------
+#
+# Four 32-bit words per identifier.  For LOCAL the last one is the local's
+# slot number; for CELL and FREE it is the number of the closed-over
+# variable.
+
+ID_QST = 0
+ID_KIND = 1
+ID_FLAGS = 2
+ID_LOCAL_NUM = 3
+ID_STRIDE = 4
 
 # -- scope kinds ----------------------------------------------------------
 #
@@ -77,7 +93,8 @@ MP_SCOPE_FLAG_HASCONSTS = 0x20
 
 # The implicit name of each scope kind.  Only "<module>" is in the static qstr
 # pool; the others live in the build's pool and so are written to an .mpy as
-# text.  Stored as bytes, like every other qstr here.
+# text.  These are the *texts*; a scope stores its name as a qstr number, so
+# the compiler interns one of these through the parse's pool.
 SCOPE_SIMPLE_NAME = {
     SCOPE_MODULE: b"<module>",
     SCOPE_LAMBDA: b"<lambda>",
@@ -92,29 +109,21 @@ class ScopeError(Exception):
     pass
 
 
-class IdInfo:
-    """One name in one scope."""
-
-    def __init__(self, qst, kind):
-        self.qst = qst          # qstr number
-        self.kind = kind
-        self.flags = 0
-        # For LOCAL this is the local's slot number; for CELL and FREE it is
-        # the number of the closed-over variable.
-        self.local_num = 0
-
-    def is_param(self):
-        return bool(self.flags & ID_FLAG_IS_PARAM)
-
-    def __repr__(self):
-        return "IdInfo(q%d, %s, flags=%#x, local=%d)" % (
-            self.qst, ID_KIND_NAMES[self.kind], self.flags, self.local_num)
-
-
 class Scope:
-    """A Python block."""
+    """A Python block.
 
-    def __init__(self, kind, pn, emit_options=0, simple_name=None):
+    The identifiers are held in one flat ``array('i')``, four words each --
+    qstr number, kind, flags, local number -- rather than one small object
+    per name.  On the target an object with four attributes was measured at
+    about 270 bytes against a 64 KB heap, and a 250-line module mentions a
+    couple of hundred names; packed, the same table is 16 bytes an entry.
+
+    Lookup is a linear scan of that array, which is what ``scope_find`` in
+    ``py/scope.c`` does: a scope has a handful of names, and a dictionary
+    keyed on the qstr cost more than the scan saves.
+    """
+
+    def __init__(self, kind, pn, emit_options=0, simple_name=None, pool=None):
         self.kind = kind
         self.parent = None
         self.next = None
@@ -127,40 +136,93 @@ class Scope:
         self.num_locals = 0
         self.stack_size = 0
         self.exc_stack_size = 0
-        # First-mention order, which is what decides local slot numbers.
-        self.id_info = []
-        self._by_qstr = {}
+        # Four words per identifier, in first-mention order -- which is what
+        # decides local slot numbers.
+        self.ids = array('i')
         if simple_name is not None:
-            # SCOPE_FUNCTION and SCOPE_CLASS take their name from the parse
-            # node; the caller supplies it since that needs the tree.
+            # A qstr number.  SCOPE_FUNCTION and SCOPE_CLASS take their name
+            # from the parse node, so the caller supplies it; that needs the
+            # tree, which this module does not see.
             self.simple_name = simple_name
-        else:
-            name = SCOPE_SIMPLE_NAME.get(kind)
-            if name is None:
+        elif pool is not None:
+            text = SCOPE_SIMPLE_NAME.get(kind)
+            if text is None:
                 raise ScopeError("scope kind %d needs an explicit name" % kind)
-            self.simple_name = name
+            self.simple_name = pool.intern(text)
+        else:
+            raise ScopeError("a scope needs either a name or a qstr pool")
+        # Set by the compiler once the code is emitted.
+        self.raw_code = None
+        self.raw_code_children = None
 
     # -- identifiers -----------------------------------------------------
+    #
+    # An identifier is referred to by its index, so that nothing has to hand
+    # out a reference into the packed array.
+
+    def num_ids(self):
+        return len(self.ids) // ID_STRIDE
+
+    def id_qst(self, i):
+        return self.ids[i * ID_STRIDE + ID_QST]
+
+    def id_kind(self, i):
+        return self.ids[i * ID_STRIDE + ID_KIND]
+
+    def set_id_kind(self, i, kind):
+        self.ids[i * ID_STRIDE + ID_KIND] = kind
+
+    def id_flags(self, i):
+        return self.ids[i * ID_STRIDE + ID_FLAGS]
+
+    def set_id_flags(self, i, flags):
+        self.ids[i * ID_STRIDE + ID_FLAGS] = flags
+
+    def id_local_num(self, i):
+        return self.ids[i * ID_STRIDE + ID_LOCAL_NUM]
+
+    def set_id_local_num(self, i, num):
+        self.ids[i * ID_STRIDE + ID_LOCAL_NUM] = num
+
+    def id_is_param(self, i):
+        return bool(self.ids[i * ID_STRIDE + ID_FLAGS] & ID_FLAG_IS_PARAM)
+
+    def swap_ids(self, i, j):
+        """Exchange two entries, keeping first-mention order otherwise."""
+        ids = self.ids
+        a = i * ID_STRIDE
+        b = j * ID_STRIDE
+        for k in range(ID_STRIDE):
+            ids[a + k], ids[b + k] = ids[b + k], ids[a + k]
 
     def find(self, qst):
-        """The IdInfo for *qst* in this scope, or None."""
-        return self._by_qstr.get(qst)
+        """The index of *qst* in this scope, or -1."""
+        ids = self.ids
+        i = 0
+        n = len(ids)
+        while i < n:
+            if ids[i + ID_QST] == qst:
+                return i // ID_STRIDE
+            i += ID_STRIDE
+        return -1
 
     def find_or_add_id(self, qst, kind):
-        info = self._by_qstr.get(qst)
-        if info is not None:
-            return info
-        info = IdInfo(qst, kind)
-        self.id_info.append(info)
-        self._by_qstr[qst] = info
-        return info
+        i = self.find(qst)
+        if i >= 0:
+            return i
+        ids = self.ids
+        ids.append(qst)
+        ids.append(kind)
+        ids.append(0)   # flags
+        ids.append(0)   # local_num
+        return len(ids) // ID_STRIDE - 1
 
     def find_global(self, qst):
-        """Look *qst* up in the outermost scope."""
+        """``(scope, index)`` for *qst* in the outermost scope, or -1."""
         s = self
         while s.parent is not None:
             s = s.parent
-        return s.find(qst)
+        return s, s.find(qst)
 
     # -- closing over ----------------------------------------------------
 
@@ -178,32 +240,36 @@ class Scope:
             if s.parent is None:
                 # The outer scope should never be reached: a name owned by the
                 # module is global, not free.
-                raise ScopeError("reached the outer scope closing over q%d" % qst)
-            info = s.find_or_add_id(qst, ID_INFO_KIND_UNDECIDED)
-            if info.kind == ID_INFO_KIND_UNDECIDED:
+                raise ScopeError("reached the outer scope closing over q%d"
+                                 % qst)
+            i = s.find_or_add_id(qst, ID_INFO_KIND_UNDECIDED)
+            kind = s.id_kind(i)
+            if kind == ID_INFO_KIND_UNDECIDED:
                 # Not declared here, so mark it free and keep climbing.
-                info.kind = ID_INFO_KIND_FREE
+                s.set_id_kind(i, ID_INFO_KIND_FREE)
             else:
-                if info.kind == ID_INFO_KIND_LOCAL:
+                if kind == ID_INFO_KIND_LOCAL:
                     # This scope owns it: turn the local into a cell.
-                    info.kind = ID_INFO_KIND_CELL
+                    s.set_id_kind(i, ID_INFO_KIND_CELL)
                 # FREE means a parent already closed over it; CELL means this
                 # scope already did.  Either way we are done.
                 return
             s = s.parent
 
-    def check_to_close_over(self, info):
-        """If an enclosing function owns *info*'s name, close over it."""
+    def check_to_close_over(self, i):
+        """If an enclosing function owns identifier *i*, close over it."""
         if self.parent is None:
             return
+        qst = self.id_qst(i)
         s = self.parent
         while s.parent is not None:
-            other = s.find(info.qst)
-            if other is not None:
-                if other.kind in (ID_INFO_KIND_LOCAL, ID_INFO_KIND_CELL,
-                                  ID_INFO_KIND_FREE):
-                    info.kind = ID_INFO_KIND_FREE
-                    self._close_over_in_parents(info.qst)
+            other = s.find(qst)
+            if other >= 0:
+                if s.id_kind(other) in (ID_INFO_KIND_LOCAL,
+                                        ID_INFO_KIND_CELL,
+                                        ID_INFO_KIND_FREE):
+                    self.set_id_kind(i, ID_INFO_KIND_FREE)
+                    self._close_over_in_parents(qst)
                 break
             s = s.parent
 
@@ -217,11 +283,10 @@ class Scope:
                 return qstrs.static_text(q)
             return "q%d" % q
         parts = []
-        for info in self.id_info:
+        for i in range(self.num_ids()):
             parts.append("%s:%s%s" % (
-                name(info.qst), ID_KIND_NAMES[info.kind],
-                "(param)" if info.is_param() else ""))
+                name(self.id_qst(i)), ID_KIND_NAMES[self.id_kind(i)],
+                "(param)" if self.id_is_param(i) else ""))
         return "%s %s [%s]" % (
-            SCOPE_KIND_NAMES[self.kind],
-            self.simple_name.decode("utf-8", "replace"),
+            SCOPE_KIND_NAMES[self.kind], name(self.simple_name),
             " ".join(parts))

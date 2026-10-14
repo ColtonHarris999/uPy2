@@ -54,9 +54,18 @@ and `weakref`, none of which exist at the pin.
 | `mpyc/tokens.py` + `lexer.py` — tokenizer | **done except t-strings; 2187 files token-exact** |
 | `mpyc/grammar.py` — grammar tables | **done; numbering confirmed against the C enum** |
 | `mpyc/parser.py` — engine + constant folding | **done except t-strings; 2172 files tree-exact** |
-| `mpyc/scope.py` — scope and identifier analysis | **done** |
+| `mpyc/scope.py` — scope and identifier analysis | **done; identifier table packed into `array('i')`** |
 | `mpyc/opcodes.py` + `bytecode.py` — opcodes, prelude, instructions | **done; 462296 instructions round-trip** |
-| the compiler walker (`py/compile.c`) | next — the last big piece |
+| `mpyc/emitbc.py` — the emitter state machine | **done** |
+| `mpyc/compile.py` — the compiler walker | **done except t-strings; 2137 files byte-exact end to end** |
+
+**End to end: 2137 / 2138 files compile byte-for-byte** into the same `.mpy`
+`mpy-cross` v1.29.0 produces, over MicroPython's own `tests/`, `tools/`,
+`examples/` and `lib/` trees. The one remaining file differs only in how a
+float constant is spelled, and the two spellings read back as the same double
+(DEVIATIONS.md, D2). 119 further files are rejected by the oracle itself and
+are rejected here too — **nothing the oracle refuses is accepted**. 12 files
+use t-string interpolation, which the lexer does not implement yet.
 
 **Container codec: 2083 / 2083 files byte-exact** against the pinned
 `mpy-cross`, over MicroPython's own `tests/`, `lib/micropython-lib`, `tools/`
@@ -227,14 +236,24 @@ There is no divergence to normalise.
 ## Running the checks
 
 ```sh
-# byte-exact round-trip against the oracle (needs mpy-cross from v1.29.0)
-python3 tests/check_roundtrip.py --mpy-cross /path/to/mpy-cross CORPUS...
+# the whole compiler, against the oracle, end to end
+python3 tests/test_compile.py --mpy-cross /path/to/mpy-cross CORPUS...
+
+# the same files compiled under both runtimes, compared by digest
+python3     tests/compile_digest.py FILE.py...
+micropython -X heapsize=256M tests/compile_digest.py FILE.py...
+
+# what a compile costs on the target
+micropython tests/compile_heap.py FILE.py...
 
 # the frame budget, statically
 python3 tools/lint_frames.py --budget 32
 
-# the package under MicroPython itself, with a heap watermark
-micropython tests/selftest_device.py *.mpy
+# the stages on their own
+python3 tests/test_lexer.py   --lexdump   tools/lexdump   CORPUS...
+python3 tests/test_parser.py  --parsedump tools/parsedump CORPUS...
+python3 tests/test_bytecode.py --mpy-cross /path/to/mpy-cross CORPUS...
+python3 tests/test_parsetree.py tests/test_qstrs.py tests/test_scope.py
 ```
 
 ## Layout
@@ -244,6 +263,11 @@ micropython tests/selftest_device.py *.mpy
 | `mpyc/mpy_format.py` | the `.mpy` container: header, varints, qstr table, constant objects, raw-code tree. A port of `py/persistentcode.c`, iterative throughout. |
 | `tests/check_roundtrip.py` | `encode(decode(x)) == x` over a corpus, against the pinned oracle |
 | `tests/selftest_device.py` | the package running on MicroPython, with a heap watermark |
+| `mpyc/emitbc.py` | the emitter: the four-pass state machine, dead-code suppression, jump sizing, and one method per bytecode operation. A port of `py/emitbc.c`. |
+| `mpyc/compile.py` | the walker: a trampoline over an explicit work stack, one handler per grammar rule. A port of `py/compile.c`. |
+| `tests/test_compile.py` | compile a corpus and require the `.mpy` to equal the oracle's, byte for byte |
+| `tests/compile_digest.py` | one digest per corpus, for comparing the two runtimes |
+| `tests/compile_heap.py` | peak live heap of a whole compile, sampled from inside |
 | `tools/lint_frames.py` | static call-graph check: no cycles, depth within budget |
 
 ### Parser engine
@@ -381,3 +405,166 @@ its instructions asked for 64 KB in a single allocation and raised
 `MemoryError` under MicroPython. It is now a generator, and the test compares
 inside the streaming loop — the kind of allocation the budget cannot spare,
 caught before it reached silicon.
+
+### The emitter is a state machine, not a function
+
+`py/emitbc.c` is driven four times over the same scope, and each pass learns
+something the next one needs:
+
+| pass | what it decides |
+|---|---|
+| `MP_PASS_SCOPE` | which names are local, cell or free, and how many labels |
+| `MP_PASS_STACK_SIZE` | the scope's maximum value-stack depth |
+| `MP_PASS_CODE_SIZE` | the size of each section, and where each label lands |
+| `MP_PASS_EMIT` | the bytes — repeated until the size stops changing |
+
+Two mechanisms carry the weight, and both are easy to get subtly wrong.
+
+**Dead code.** `suppress` drops everything written after an unconditional
+jump, raise or return until the next label — that is MicroPython's whole
+dead-code elimination. A suppressed write advances no offset, so the dead
+bytes never exist. Code info is *not* suppressed, which is why the two
+sections need separate write paths.
+
+**Jump sizing.** A jump offset is one or two bytes, measured from the
+instruction *after* the jump — so the instruction's own length is part of the
+arithmetic, and the length depends on the offset. The encoding may only ever
+*shrink* from one pass to the next; if it grew, a label already placed in this
+pass would have been written with a stale distance. `MP_PASS_CODE_SIZE` reads
+label offsets it has not assigned yet, so it has to over-estimate: C relies on
+whatever `m_new` left in the array, and `mpyc` makes that explicit with a
+sentinel large enough to force the wide encoding.
+
+### The walker does not recurse
+
+`py/compile.c` is written as mutual recursion: `compile_node` dispatches to a
+per-rule function, which calls `compile_node` on each child, so the C stack
+grows with the nesting depth of the *source*. On a machine whose call stack is
+a fixed pool of hardware frames, with 32 budgeted for the whole compiler, that
+is not available.
+
+So the walk runs as a trampoline:
+
+* `_work` is an explicit stack of work items in the heap — five 32-bit words
+  each in an `array('i')`, so a deep queue costs words rather than objects.
+* A handler never calls the walker. It inspects its node, emits what it can
+  emit now, and **returns a plan**: the work items that must run after it, in
+  order. The trampoline pushes the plan in reverse, so it pops in source
+  order.
+* Code that has to run *between* two children becomes its own work item. That
+  is why there are items like `W_CALL_ARGS_END`: C can simply write the
+  statement after the loop.
+* Accumulators C keeps in `compiler_t` across a loop body — a call's argument
+  counts, the saved break/continue labels, a function's default-argument
+  counters — live on two more explicit stacks, because the begin and the end
+  are now separate items.
+
+The Python call depth is therefore constant regardless of how deeply the
+source nests. `tools/lint_frames.py` reports **13 frames against the 32-frame
+budget, with zero cycles**, and it now resolves the dispatch tables rather
+than losing the walker's depth to an indirect call (see below).
+
+Two recursive shapes in `compile.c` flatten into loops rather than work items,
+because the nesting is a chain rather than a tree: `compile_with_stmt_helper`
+(open each `with` item in turn, close them in reverse) and
+`compile_scope_comp_iter` (open each nested `for` of a comprehension, close
+them in reverse).
+
+### The order things happen in is load-bearing
+
+Three orderings turned out to matter, and each produced a byte difference
+until it was fixed.
+
+**Scope creation order decides the qstr table.** A scope's name is interned
+when its first pass starts, so the order scopes are *created* in is the order
+their names enter the module's qstr table. In `compile_decorated`, C compiles
+the decorator expressions first — which may define scopes of their own, such
+as a lambda in `@cached(provider=lambda: ...)` — and only then creates the
+function's scope. Building the plan eagerly got that backwards, so creating
+the scope is its own work item (`W_FUNCDEF`, `W_CLASSDEF`). Caught by
+`tools/ar_util.py`, where `<lambda>` landed one slot late.
+
+**The source file name is interned before lexing.** `mp_lexer_new_*` takes it
+as a qstr, so a string literal equal to the file's own name finds it already
+interned and becomes a qstr leaf rather than a constant object. Caught by
+`tests/basics/sys_path.py`, which contains the literal `"sys_path.py"`.
+
+**Identifiers are numbered in first-mention order**, and that numbering sets
+local slot numbers. So a declaration that C performs *after* walking a
+sub-expression has to stay after it: the walrus target in a comprehension
+(`W_NAMEDEXPR`) is declared in a work item that runs once the value expression
+has been walked, not when the plan is built.
+
+### What a compile costs on the target
+
+`tests/compile_heap.py` samples `gc.mem_free` after every pass over every
+scope — the peak is in the middle of the run, with the parse tree, the scopes
+and the emitted code all live at once, so it cannot be seen from outside. It
+reports two numbers: **live**, what is still reachable at the peak (measured
+by collecting while holding it), which is what has to fit the budget; and
+**churn**, total allocation including garbage, which is transient collector
+pressure.
+
+| lines | scopes | code | live | churn |
+|---|---|---|---|---|
+| 14 | 1 | 75 B | 14.4 KB | 127 KB |
+| 54 | 12 | 493 B | 23.9 KB | 657 KB |
+| 251 | 24 | 1623 B | 65.8 KB | 1121 KB |
+| 422 | 62 | 3264 B | 96.7 KB | 240 KB |
+| 621 | 30 | 3313 B | 107.9 KB | 1372 KB |
+
+Roughly a 10 KB baseline plus 0.22 KB per line, so a 200-line module is about
+**55 KB live against the 64 KB budget** — on the 64-bit unix port, where every
+pointer, every list slot and every dictionary entry is twice the target's
+width, so this is an upper bound rather than the figure.
+
+Getting there took three measured fixes, each of which is in the code as a
+comment:
+
+| what | before | after |
+|---|---|---|
+| the firmware qstr pool, 607 entries | 30.8 KB as a set of strings | **8.7 KB** as one sorted length-prefixed blob, searched by bisection |
+| the static qstr pool, rebuilt per parse | 8.2 KB each | **0.2 KB** — built once at module level |
+| a scope's identifiers, 160 of them | 42.9 KB as one object each | **24.8 KB** — four words each in an `array('i')`, found by linear scan as `scope_find` does |
+
+### Verified end to end
+
+| check | result |
+|---|---|
+| byte-exact against `mpy-cross` v1.29.0 | **2137 / 2138 files** |
+| functions emitted | 10337, 466380 instructions, **207 distinct opcode values** |
+| the one exception | a float constant spelled differently, same value (D2) |
+| rejected by the oracle, rejected here | **119 / 119** |
+| accepted here but rejected by the oracle | **0** |
+| crashes | **0** |
+| the same files under CPython and MicroPython v1.29.0 | **2137 / 2138 identical** |
+| the one exception | the same file, same cause: `float_repr` borrows the runtime's `%e` (DEVIATIONS.md, D2) |
+| frame budget | **13 of 32, zero cycles** |
+
+A single wrong byte anywhere — in the lexer, the folder, the scope analysis,
+the emitter, the qstr or constant table, or the container — fails this test.
+That is what makes it worth more than the per-stage checks that came before
+it: those compared a piece of the pipeline against a piece of the oracle,
+this one compares the product.
+
+### The frame linter had to learn about dispatch tables
+
+The walker calls everything through two tables — `self._steps[op](...)` and
+`self._rules[kind](pn)`, plus `self._emit_fns[i](...)` — and a call through a
+subscript is invisible to a name-based call graph. The linter reported
+9 frames and no cycles while *not seeing the walker at all*.
+
+It now resolves three shapes: a table assigned a literal of `self.m`
+references; a table built with `getattr` in the same function that assigns it,
+narrowed to a literal name prefix (`getattr(self, "h_" + name)` resolves to
+exactly the `h_*` methods); and the receiver's class from an earlier
+`self.obj = SomeClass(...)`. Anything it still cannot resolve — including a
+table it can see but cannot look into — is **counted and reported**, so the
+gap is visible rather than silent. With that, the deepest chain is 13 frames
+and runs through the walker, as it should.
+
+Two code changes came out of fixing the tool rather than the other way round,
+and both are commented as such: the trampoline indexes `self._steps` instead
+of a local alias, and `_s_emit` indexes `self._emit_fns` in place of binding
+it to a local first. A dispatch that the tool cannot see is a dispatch nobody
+can audit.

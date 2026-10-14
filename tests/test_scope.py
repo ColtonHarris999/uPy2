@@ -6,6 +6,9 @@ oracle here: MicroPython's scopes never leave the compiler, so correctness is
 established later by the emitter's byte-exact output.  What is checked here is
 the algorithm's own invariants.
 
+Identifiers are referred to by index into a scope's packed table, so these
+tests pass indices around rather than objects.
+
     python3 tests/test_scope.py
     micropython tests/test_scope.py
 """
@@ -25,13 +28,17 @@ def check(cond, what):
         print("FAIL: %s" % what)
 
 
+# A scope stores its name as a qstr number, so these tests use numbers
+# throughout; q1 is the empty string in every build.
+Q_F = 1
+
+
 def chain(*kinds):
     """A parent-to-child chain of scopes."""
     scopes = []
     prev = None
     for k in kinds:
-        sc = S.Scope(k, 0) if k in S.SCOPE_SIMPLE_NAME else S.Scope(
-            k, 0, simple_name=b"f")
+        sc = S.Scope(k, 0, simple_name=Q_F)
         sc.parent = prev
         scopes.append(sc)
         prev = sc
@@ -54,39 +61,63 @@ def test_kind_predicates():
               "%s is not comp-like" % S.SCOPE_KIND_NAMES[k])
 
 
+class _StubPool:
+    """Just enough of mpyc.parser.QstrPool to name implicit scopes."""
+
+    def __init__(self):
+        self.seen = []
+
+    def intern(self, raw):
+        if raw not in self.seen:
+            self.seen.append(raw)
+        return 100 + self.seen.index(raw)
+
+
 def test_simple_names():
-    check(S.Scope(S.SCOPE_MODULE, 0).simple_name == b"<module>", "module name")
-    check(S.Scope(S.SCOPE_GEN_EXPR, 0).simple_name == b"<genexpr>",
-          "genexpr name")
-    check(S.Scope(S.SCOPE_FUNCTION, 0, simple_name=b"foo").simple_name == b"foo",
+    # An implicit name is interned through the pool, since the numbers of
+    # "<lambda>" and friends are build-specific.
+    pool = _StubPool()
+    mod = S.Scope(S.SCOPE_MODULE, 0, pool=pool)
+    gen = S.Scope(S.SCOPE_GEN_EXPR, 0, pool=pool)
+    check(pool.seen[mod.simple_name - 100] == b"<module>", "module name")
+    check(pool.seen[gen.simple_name - 100] == b"<genexpr>", "genexpr name")
+    check(S.Scope(S.SCOPE_FUNCTION, 0, simple_name=7).simple_name == 7,
           "an explicit name is kept")
     raised = False
     try:
-        S.Scope(S.SCOPE_FUNCTION, 0)
+        S.Scope(S.SCOPE_FUNCTION, 0, pool=pool)
     except S.ScopeError:
         raised = True
     check(raised, "a function scope demands a name")
+    raised = False
+    try:
+        S.Scope(S.SCOPE_MODULE, 0)
+    except S.ScopeError:
+        raised = True
+    check(raised, "an implicit name demands a pool")
 
 
 def test_id_order_and_lookup():
-    sc = S.Scope(S.SCOPE_FUNCTION, 0, simple_name=b"f")
+    sc = S.Scope(S.SCOPE_FUNCTION, 0, simple_name=Q_F)
     a = sc.find_or_add_id(10, S.ID_INFO_KIND_LOCAL)
     b = sc.find_or_add_id(11, S.ID_INFO_KIND_LOCAL)
     again = sc.find_or_add_id(10, S.ID_INFO_KIND_GLOBAL_EXPLICIT)
-    check(again is a, "find_or_add_id returns the existing entry")
-    check(again.kind == S.ID_INFO_KIND_LOCAL,
+    check(again == a, "find_or_add_id returns the existing entry")
+    check(sc.id_kind(again) == S.ID_INFO_KIND_LOCAL,
           "an existing entry keeps its kind")
-    check([i.qst for i in sc.id_info] == [10, 11],
+    check([sc.id_qst(i) for i in range(sc.num_ids())] == [10, 11],
           "ids stay in first-mention order, which sets local numbers")
-    check(sc.find(11) is b, "find locates an id")
-    check(sc.find(99) is None, "find returns None for an unknown id")
+    check(sc.find(11) == b, "find locates an id")
+    check(sc.find(99) == -1, "find returns -1 for an unknown id")
 
 
 def test_find_global():
     mod, fn, inner = chain(S.SCOPE_MODULE, S.SCOPE_FUNCTION, S.SCOPE_FUNCTION)
     g = mod.find_or_add_id(7, S.ID_INFO_KIND_GLOBAL_IMPLICIT)
-    check(inner.find_global(7) is g, "find_global reaches the outermost scope")
-    check(inner.find_global(8) is None, "find_global misses an unknown name")
+    outer, i = inner.find_global(7)
+    check(outer is mod and i == g, "find_global reaches the outermost scope")
+    outer, i = inner.find_global(8)
+    check(outer is mod and i == -1, "find_global misses an unknown name")
 
 
 def test_close_over_one_level():
@@ -97,8 +128,10 @@ def test_close_over_one_level():
     x_outer = outer.find_or_add_id(20, S.ID_INFO_KIND_LOCAL)
     x_inner = inner.find_or_add_id(20, S.ID_INFO_KIND_UNDECIDED)
     inner.check_to_close_over(x_inner)
-    check(x_inner.kind == S.ID_INFO_KIND_FREE, "the inner reference is FREE")
-    check(x_outer.kind == S.ID_INFO_KIND_CELL, "the owner's local becomes CELL")
+    check(inner.id_kind(x_inner) == S.ID_INFO_KIND_FREE,
+          "the inner reference is FREE")
+    check(outer.id_kind(x_outer) == S.ID_INFO_KIND_CELL,
+          "the owner's local becomes CELL")
 
 
 def test_close_over_two_levels():
@@ -109,12 +142,13 @@ def test_close_over_two_levels():
     x_a = a.find_or_add_id(21, S.ID_INFO_KIND_LOCAL)
     x_c = c.find_or_add_id(21, S.ID_INFO_KIND_UNDECIDED)
     c.check_to_close_over(x_c)
-    check(x_c.kind == S.ID_INFO_KIND_FREE, "the deepest reference is FREE")
-    check(x_a.kind == S.ID_INFO_KIND_CELL, "the owner becomes CELL")
+    check(c.id_kind(x_c) == S.ID_INFO_KIND_FREE,
+          "the deepest reference is FREE")
+    check(a.id_kind(x_a) == S.ID_INFO_KIND_CELL, "the owner becomes CELL")
     mid = b.find(21)
-    check(mid is not None, "the middle scope gained an entry for the name")
-    if mid is not None:
-        check(mid.kind == S.ID_INFO_KIND_FREE,
+    check(mid >= 0, "the middle scope gained an entry for the name")
+    if mid >= 0:
+        check(b.id_kind(mid) == S.ID_INFO_KIND_FREE,
               "the middle scope's entry is FREE, to thread the value through")
 
 
@@ -125,7 +159,7 @@ def test_no_close_over_when_global():
     mod.find_or_add_id(22, S.ID_INFO_KIND_LOCAL)
     x = fn.find_or_add_id(22, S.ID_INFO_KIND_UNDECIDED)
     fn.check_to_close_over(x)
-    check(x.kind == S.ID_INFO_KIND_UNDECIDED,
+    check(fn.id_kind(x) == S.ID_INFO_KIND_UNDECIDED,
           "a module-level name is not closed over")
 
 
@@ -133,9 +167,9 @@ def test_no_close_over_without_owner():
     mod, a, b = chain(S.SCOPE_MODULE, S.SCOPE_FUNCTION, S.SCOPE_FUNCTION)
     x = b.find_or_add_id(23, S.ID_INFO_KIND_UNDECIDED)
     b.check_to_close_over(x)
-    check(x.kind == S.ID_INFO_KIND_UNDECIDED,
+    check(b.id_kind(x) == S.ID_INFO_KIND_UNDECIDED,
           "a name no parent owns stays undecided")
-    check(a.find(23) is None, "and no parent gains a spurious entry")
+    check(a.find(23) == -1, "and no parent gains a spurious entry")
 
 
 def test_close_over_idempotent():
@@ -146,10 +180,12 @@ def test_close_over_idempotent():
     b.check_to_close_over(x_b)
     x_c = c.find_or_add_id(24, S.ID_INFO_KIND_UNDECIDED)
     c.check_to_close_over(x_c)
-    check(a.find(24).kind == S.ID_INFO_KIND_CELL, "the owner stays CELL")
-    check(b.find(24).kind == S.ID_INFO_KIND_FREE, "the middle stays FREE")
-    check(x_c.kind == S.ID_INFO_KIND_FREE, "the second closure is also FREE")
-    check(len(b.id_info) == 1, "no duplicate entry was added")
+    check(a.id_kind(a.find(24)) == S.ID_INFO_KIND_CELL, "the owner stays CELL")
+    check(b.id_kind(b.find(24)) == S.ID_INFO_KIND_FREE,
+          "the middle stays FREE")
+    check(c.id_kind(x_c) == S.ID_INFO_KIND_FREE,
+          "the second closure is also FREE")
+    check(b.num_ids() == 1, "no duplicate entry was added")
 
 
 def test_deep_chain_needs_no_frames():
@@ -160,13 +196,14 @@ def test_deep_chain_needs_no_frames():
     scopes[1].find_or_add_id(25, S.ID_INFO_KIND_LOCAL)
     deep = scopes[-1].find_or_add_id(25, S.ID_INFO_KIND_UNDECIDED)
     scopes[-1].check_to_close_over(deep)
-    check(deep.kind == S.ID_INFO_KIND_FREE, "a 400-deep closure resolves")
-    check(scopes[1].find(25).kind == S.ID_INFO_KIND_CELL,
+    check(scopes[-1].id_kind(deep) == S.ID_INFO_KIND_FREE,
+          "a 400-deep closure resolves")
+    check(scopes[1].id_kind(scopes[1].find(25)) == S.ID_INFO_KIND_CELL,
           "the distant owner becomes CELL")
     threaded = 0
     for sc in scopes[2:-1]:
-        info = sc.find(25)
-        if info is not None and info.kind == S.ID_INFO_KIND_FREE:
+        i = sc.find(25)
+        if i >= 0 and sc.id_kind(i) == S.ID_INFO_KIND_FREE:
             threaded += 1
     check(threaded == len(scopes) - 3,
           "every scope in between threads it through (%d)" % threaded)

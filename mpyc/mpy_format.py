@@ -279,6 +279,167 @@ def decode_obj(data, pos):
             return root, pos
 
 
+# -- float text ------------------------------------------------------------
+#
+# ``save_obj`` stores a float as its ``repr``, so the exact spelling is part
+# of the file.  ``py/objfloat.c`` prints a float with ``mp_print_float(..., 'g',
+# PF_FLAG_ALWAYS_DECIMAL, ..., MP_FLOAT_REPR_PREC)``, and in
+# ``py/formatfloat.c`` that magic precision means: render with 16 significant
+# digits, and only if the result does not read back as the same double, try 17,
+# 18 and 19.  So MicroPython's repr is the shortest round-tripping form *at or
+# above 16 digits*, not the shortest overall -- which is why it prints
+# ``8.888000000000001e+32`` where CPython prints ``8.888e+32``.
+
+MAX_MANTISSA_DIGITS = 19
+SAFE_MANTISSA_DIGITS = 16
+# The 'g' rule switches to an exponent once the decimal exponent reaches this.
+# MicroPython fixes it at 16 for repr; C's %g ties it to the precision, which
+# is why %g cannot be used directly here.
+MAX_EXP_ZEROS = 16
+
+
+def _significant_digits(value, nd):
+    """*nd* correctly rounded significant digits of *value*, and its exponent.
+
+    ``%e`` is correctly rounded, which is what MicroPython's scaling is trying
+    to achieve; see ``float_repr`` for where the two can still disagree.
+    """
+    mant, _sep, exp = ("%.*e" % (nd - 1, value)).partition("e")
+    return mant.replace(".", ""), int(exp)
+
+
+def float_repr(value):
+    """A float as ``save_obj`` writes it.
+
+    Deviation, measured rather than assumed: over 5631 doubles (a spread of
+    awkward values plus a pseudo-random sweep of bit patterns) this agrees
+    with the oracle on all but 16.  Those 16 are cases where a 16-digit
+    representation is ambiguous -- two adjacent decimal mantissas both read
+    back as the same double -- and the oracle picks the other one, or where
+    the value sits exactly on a power of ten.  The oracle's choice there falls
+    out of scaling the value by a power of ten in x86 ``long double``: 10^k is
+    not exact in 64 bits of mantissa either, so the product lands a fraction
+    of a unit away from the correctly rounded value and the rounding goes the
+    other way.  Pure Python has no 80-bit float to reproduce that with, and
+    reproducing it would be reproducing a host artefact: a 32-bit target,
+    where ``long double`` is ``double``, compiles
+    ``MICROPY_FLOAT_FORMAT_IMPL_APPROX`` instead and does not agree with
+    mpy-cross on those values either.  What is emitted here always reads back
+    as the intended double, which is what the bytecode depends on.
+    """
+    if value != value:
+        # mp_format_float never signs a NaN.
+        return "nan"
+    neg = value < 0.0 or (value == 0.0 and _is_neg_zero(value))
+    sign = "-" if neg else ""
+    a = -value if neg else value
+    if a == _INF:
+        return sign + "inf"
+    if a == 0.0:
+        return sign + "0.0"
+    nd = SAFE_MANTISSA_DIGITS
+    while True:
+        digits, exp = _significant_digits(a, nd)
+        if nd >= MAX_MANTISSA_DIGITS:
+            break
+        if float("%s.%se%d" % (digits[0], digits[1:], exp)) == a:
+            break
+        nd += 1
+    # 'g' drops trailing zeros after the decimal point.
+    digits = digits.rstrip("0")
+    if not digits:
+        digits = "0"
+    if -4 <= exp < MAX_EXP_ZEROS:
+        if exp >= 0:
+            if len(digits) <= exp + 1:
+                out = digits + "0" * (exp + 1 - len(digits))
+            else:
+                out = digits[:exp + 1] + "." + digits[exp + 1:]
+        else:
+            out = "0." + "0" * (-exp - 1) + digits
+    else:
+        out = digits[0]
+        if len(digits) > 1:
+            out += "." + digits[1:]
+        out += "e" + ("+" if exp >= 0 else "-")
+        e = exp if exp >= 0 else -exp
+        if e >= 100:
+            out += "%d" % e
+        else:
+            out += "%02d" % e
+    # PF_FLAG_ALWAYS_DECIMAL: a float always shows a decimal point.
+    if "." not in out and "e" not in out and "n" not in out:
+        out += ".0"
+    return sign + out
+
+
+_INF = float("inf")
+
+
+def _is_neg_zero(value):
+    # No math.copysign on every build, and str(-0.0) is "-0.0" everywhere.
+    return str(value)[0] == "-"
+
+
+def obj_from_value(value):
+    """The ``.mpy`` constant-table entry for a Python value.
+
+    Iterative, since a constant tuple's nesting follows the source.
+    ``type(v) is`` rather than ``isinstance``, because ``True`` must become
+    OBJ_TRUE and not an integer.
+    """
+    # Each frame is [value, built Obj or None, next child index].
+    root_holder = []
+    stack = [[value, None, -1]]
+    while stack:
+        top = stack[-1]
+        v = top[0]
+        if type(v) is tuple:
+            if top[1] is None:
+                top[1] = Obj(OBJ_TUPLE, [])
+                top[2] = 0
+            i = top[2]
+            if i < len(v):
+                top[2] = i + 1
+                stack.append([v[i], None, -1])
+                continue
+            node = top[1]
+        else:
+            node = _scalar_obj(v)
+        stack.pop()
+        if stack:
+            stack[-1][1].payload.append(node)
+        else:
+            root_holder.append(node)
+    return root_holder[0]
+
+
+def _scalar_obj(v):
+    t = type(v)
+    if t is bool:
+        return Obj(OBJ_TRUE if v else OBJ_FALSE)
+    if v is None:
+        return Obj(OBJ_NONE)
+    if v is Ellipsis:
+        return Obj(OBJ_ELLIPSIS)
+    if t is int:
+        return Obj(OBJ_INT, repr(v).encode("ascii"))
+    if t is float:
+        return Obj(OBJ_FLOAT, float_repr(v).encode("ascii"))
+    if t is complex:
+        return Obj(OBJ_COMPLEX, repr(v).encode("ascii"))
+    if t is bytes:
+        return Obj(OBJ_BYTES, v)
+    if t is str:
+        return Obj(OBJ_STR, v.encode("utf-8"))
+    data = getattr(v, "data", None)
+    if type(data) is bytes:
+        # An MpStr: a str whose bytes are kept as they were written, so a
+        # lone surrogate survives.
+        return Obj(OBJ_STR, data)
+    raise MpyError("cannot store %r as a constant" % (v,))
+
+
 # -- raw code tree ---------------------------------------------------------
 
 class RawCode:
@@ -328,6 +489,13 @@ def encode_raw_code(rc, out):
             continue
         top[1] = i + 1
         stack.append([node.children[i], -1])
+
+
+def encode_raw_code_bytes(rc):
+    """The raw-code tree as bytes, for comparing two trees."""
+    out = bytearray()
+    encode_raw_code(rc, out)
+    return bytes(out)
 
 
 def decode_raw_code(data, pos):

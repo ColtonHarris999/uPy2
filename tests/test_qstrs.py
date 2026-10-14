@@ -75,18 +75,46 @@ def test_index_consistency():
               "entry %d (%r) maps back to itself" % (i, text))
 
 
+class _Pool:
+    """Just enough of mpyc.parser.QstrPool for these tests."""
+
+    def __init__(self):
+        self._texts = []
+        self._static = {}
+        for i in range(1, qstrs.STATIC_POOL_SIZE):
+            self._static[qstrs.static_text(i).encode("utf-8")] = i
+
+    def intern(self, raw):
+        n = self._static.get(raw)
+        if n is not None:
+            return n
+        if raw in self._texts:
+            return qstrs.STATIC_POOL_SIZE + self._texts.index(raw)
+        self._texts.append(raw)
+        return qstrs.STATIC_POOL_SIZE + len(self._texts) - 1
+
+    def text(self, number):
+        if number < qstrs.STATIC_POOL_SIZE:
+            return qstrs.static_text(number).encode("utf-8")
+        return self._texts[number - qstrs.STATIC_POOL_SIZE]
+
+
 def test_module_table():
-    t = qstrtable.QstrTable()
-    check(t.index("foo") == 0, "first qstr gets index 0")
-    check(t.index("bar") == 1, "second qstr gets index 1")
-    check(t.index("foo") == 0, "a repeat returns the same index")
+    pool = _Pool()
+    t = qstrtable.QstrTable(pool)
+    foo = pool.intern(b"foo")
+    bar = pool.intern(b"bar")
+    check(t.index(foo) == 0, "first qstr gets index 0")
+    check(t.index(bar) == 1, "second qstr gets index 1")
+    check(t.index(foo) == 0, "a repeat returns the same index")
     check(len(t) == 2, "repeats do not grow the table")
-    check(t.text(1) == "bar", "text() reads back")
+    check(t.text(1) == b"bar", "text() reads back through the pool")
 
     # Static and dynamic share the table, in first-use order.
-    t2 = qstrtable.QstrTable()
-    for text in ("mymod.py", "<module>", "<listcomp>", "self"):
-        t2.index(text)
+    t2 = qstrtable.QstrTable(pool)
+    texts = (b"mymod.py", b"<module>", b"<listcomp>", b"self")
+    for text in texts:
+        t2.index(pool.intern(text))
     entries = t2.entries()
     check(len(entries) == 4, "four entries")
     check(isinstance(entries[0], bytes) and entries[0] == b"mymod.py",
@@ -99,7 +127,7 @@ def test_module_table():
     check(entries[1].index == qstrs.static_index("<module>"),
           "the static index matches the pool")
     # entry_text inverts entries() for both kinds.
-    for text, entry in zip(t2.texts(), entries):
+    for text, entry in zip(texts, entries):
         check(qstrtable.entry_text(entry) == text,
               "entry_text round-trips %r" % text)
 
@@ -107,10 +135,13 @@ def test_module_table():
 def test_encoding_round_trip():
     # A table must survive encode_qstr/decode_qstr unchanged, including the
     # empty string and non-ASCII text.
-    t = qstrtable.QstrTable()
-    for text in ("", "self", "café", "x" * 300, "<module>"):
-        t.index(text)
-    for text, entry in zip(t.texts(), t.entries()):
+    pool = _Pool()
+    t = qstrtable.QstrTable(pool)
+    texts = (b"", b"self", "caf\u00e9".encode("utf-8"), b"x" * 300,
+             b"<module>")
+    for text in texts:
+        t.index(pool.intern(text))
+    for text, entry in zip(texts, t.entries()):
         buf = bytearray()
         mpy_format.encode_qstr(entry, buf)
         back, pos = mpy_format.decode_qstr(bytes(buf), 0)

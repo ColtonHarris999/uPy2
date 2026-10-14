@@ -25,6 +25,7 @@ similar).  The module table that feature consults is empty in mpy-cross, so
 the path never fires there; confirmed by probing the oracle.
 """
 
+from . import constnode as CN
 from . import grammar as G
 from . import parsetree as PT
 from . import qstrs
@@ -42,16 +43,28 @@ PARSE_EVAL_INPUT = 2
 
 
 class ParseError(Exception):
-    """A syntax error, carrying the kind the C parser would raise."""
+    """A syntax error, carrying the kind the C parser would raise.
+
+    ``Exception.__init__`` is not callable as an unbound method on
+    MicroPython, so the message is kept here and rendered by ``__str__``.
+    """
 
     def __init__(self, kind, msg, line):
-        Exception.__init__(self, msg)
         self.kind = kind  # "SyntaxError" or "IndentationError"
         self.msg = msg
         self.line = line
 
     def __str__(self):
         return "%s: %s (line %d)" % (self.kind, self.msg, self.line)
+
+
+# qstrs.py holds the static pool as text, because that is how the source
+# spells it; the compiler works in bytes throughout, so the bytes-keyed view
+# is derived here, once.  Index 0 is skipped: MP_QSTRnull's text is also the
+# empty string, and interning "" must yield 1.
+_STATIC_BY_BYTES = {}
+for _i in range(1, qstrs.STATIC_POOL_SIZE):
+    _STATIC_BY_BYTES[qstrs.static_text(_i).encode("utf-8")] = _i
 
 
 class QstrPool:
@@ -73,11 +86,10 @@ class QstrPool:
         if preloaded is None:
             preloaded = _default_preloaded()
         self._preloaded = preloaded
-        # The static pool keyed by bytes: qstrs are byte sequences here, as
-        # they are in MicroPython.  Every static entry is ASCII.
-        self._static = {}
-        for i in range(1, qstrs.STATIC_POOL_SIZE):
-            self._static[qstrs.static_text(i).encode("utf-8")] = i
+        # The static pool keyed by bytes.  Built once at module level: it is
+        # the same 165 entries for every parse, and rebuilding it per parse
+        # was measured at 8 KB against a 64 KB heap.
+        self._static = _STATIC_BY_BYTES
 
     def intern(self, raw):
         """*raw* is bytes.  Returns its qstr number, assigning one if new."""
@@ -222,13 +234,10 @@ def _default_preloaded():
     """
     if not _PRELOADED_CACHE:
         try:
-            from .qstr_pool import PRELOADED
+            from .qstr_pool import POOL
         except ImportError:
-            PRELOADED = frozenset()
-        encoded = set()
-        for t in PRELOADED:
-            encoded.add(t.encode("utf-8"))
-        _PRELOADED_CACHE.append(encoded)
+            POOL = frozenset()
+        _PRELOADED_CACHE.append(POOL)
     return _PRELOADED_CACHE[0]
 
 MODULE_CONSTANTS = {
@@ -247,6 +256,14 @@ class Parser:
         self.lex = lexer
         self.input_kind = input_kind
         self.pool = pool if pool is not None else QstrPool()
+        # ``mp_lexer_new_*`` takes the source name as a qstr, so it is already
+        # interned before the first token is read.  That is load-bearing: a
+        # string literal equal to the file's own name finds it interned and
+        # becomes a qstr leaf rather than a constant object.
+        name = lexer.src_name
+        if not isinstance(name, bytes):
+            name = name.encode("utf-8")
+        self.source_name = self.pool.intern(name)
         self.tree = PT.ParseTree()
         # Rule stack entries are three parallel lists rather than tuples: no
         # object per entry, and the depth can reach a few hundred.
@@ -300,58 +317,19 @@ class Parser:
         return self._new_const_node(src_line, value)
 
     def const_value(self, pn):
-        """The Python value of a constant node, or None if it is not one.
-
-        Returns a one-tuple so a legitimate None/False value is
-        distinguishable from "not a constant".
-        """
-        if PT.is_small_int(pn):
-            return (PT.small_int_value(pn),)
-        if PT.is_struct(pn) and self.tree.struct_kind(pn) == G.RULE_const_object:
-            return (self.tree.const(self.tree.child(pn, 0)),)
-        if PT.is_token(pn):
-            arg = PT.leaf_arg(pn)
-            if arg == T.MP_TOKEN_KW_NONE:
-                return (None,)
-            if arg == T.MP_TOKEN_KW_TRUE:
-                return (True,)
-            if arg == T.MP_TOKEN_KW_FALSE:
-                return (False,)
-            if arg == T.MP_TOKEN_ELLIPSIS:
-                return (Ellipsis,)
-        if PT.is_string(pn):
-            return (PT.MpStr(self.pool.text(PT.leaf_arg(pn))),)
-        if PT.is_struct(pn) and self.tree.struct_kind(pn) == G.RULE_atom_paren:
-            # `()` survives as atom_paren with a NULL child, and counts as the
-            # constant empty tuple (mp_parse_node_is_const).
-            if PT.is_null(self.tree.child(pn, 0)):
-                return ((),)
-        return None
+        return CN.const_value(self.tree, self.pool, pn)
 
     def is_const(self, pn):
-        return self.const_value(pn) is not None
+        return CN.is_const(self.tree, self.pool, pn)
 
     def number_value(self, pn):
-        """mp_parse_node_get_number_maybe: an int or float, else None."""
-        v = self.const_value(pn)
-        if v is None:
-            return None
-        if type(v[0]) is int or type(v[0]) is float:
-            return v
-        return None
-
-    def _is_const_bool(self, pn, value):
-        """parse_node_is_const_bool: a constant whose truth equals *value*."""
-        v = self.const_value(pn)
-        if v is None:
-            return False
-        return bool(v[0]) == value
+        return CN.number_value(self.tree, self.pool, pn)
 
     def is_const_true(self, pn):
-        return self._is_const_bool(pn, True)
+        return CN.is_const_bool(self.tree, self.pool, pn, True)
 
     def is_const_false(self, pn):
-        return self._is_const_bool(pn, False)
+        return CN.is_const_bool(self.tree, self.pool, pn, False)
 
     # -- turning the current token into a node ---------------------------
 
@@ -881,6 +859,9 @@ class Parser:
         if lex.tok_kind != T.MP_TOKEN_END or len(self.result) == 0:
             self.syntax_error()
         self.tree.root = self.result[0]
+        # The tree's id and string leaves are qstr *numbers*, so it is only
+        # readable alongside the pool that made them; the compiler needs both.
+        self.tree.pool = self.pool
         return self.tree
 
     def syntax_error(self):

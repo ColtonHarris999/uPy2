@@ -103,13 +103,10 @@ def oracle_preloaded():
     """
     if not _ORACLE_POOL:
         try:
-            from oracle_qstr_pool import PRELOADED
+            from oracle_qstr_pool import POOL
         except ImportError:
-            PRELOADED = frozenset()
-        encoded = set()
-        for t in PRELOADED:
-            encoded.add(t.encode("utf-8"))
-        _ORACLE_POOL.append(encoded)
+            POOL = frozenset()
+        _ORACLE_POOL.append(POOL)
     return _ORACLE_POOL[0]
 
 

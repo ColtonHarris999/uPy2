@@ -42,16 +42,108 @@ class Collector(ast.NodeVisitor):
 
     * ``Name(...)`` resolves to a module-level function of that name, or to
       the ``__init__`` of a class of that name (a constructor call).
-    * ``obj.m(...)`` resolves to *every* method named ``m``, since the
-      receiver's type is unknown.
+    * ``self.m(...)`` resolves to the enclosing class's own ``m``.
+    * ``obj.m(...)``, where ``obj`` is anything else, resolves to every
+      method named ``m`` *except* the enclosing class's: a receiver spelled
+      something other than ``self`` is a different object, and nothing here
+      hands a method another instance of its own class.  Without that, a
+      method that delegates to a same-named method on a member -- as
+      ``QstrTable.text`` does to the pool's -- reads as self-recursive.
+    * A call through a table, ``self.TABLE[i](...)``, resolves to whatever
+      ``self.TABLE = (self.a, self.b, ...)`` put in it.  The walker
+      dispatches its work items that way, and without this the deepest
+      chains in the compiler would be invisible.
+    * A table built with ``getattr`` in the same function that assigns it --
+      ``self.TABLE = tuple(getattr(self.obj, n) for n in NAMES)``, or a loop
+      that appends ``getattr(self, "h_" + name)`` -- resolves to the methods
+      of the receiver's class, narrowed to a literal name prefix when the
+      ``getattr`` has one.  The receiver's class comes from ``self`` itself,
+      or from an earlier ``self.obj = SomeClass(...)``.
+
+    Indirect calls it still cannot resolve, and tables it cannot see into,
+    are counted and reported, so the gap is visible rather than silent.
     """
 
-    def __init__(self, path, defs, calls, classes):
+    def __init__(self, path, defs, calls, classes, tables, table_sources,
+                 unresolved, class_names):
         self.path = path
         self.defs = defs
         self.calls = calls
         self.classes = classes
+        self.tables = tables
+        self.table_sources = table_sources
+        self.unresolved = unresolved
+        self.class_names = class_names
+        self.attr_types = {}
         self.stack = []
+
+    def _record_table(self, node, sources):
+        """Learn what a ``self.NAME = ...`` assignment holds.
+
+        *sources* are the ``getattr`` receivers seen anywhere in the same
+        function, used when the assigned value is not a literal.
+        """
+        if len(node.targets) != 1:
+            return
+        name = _table_name(node.targets[0])
+        if name is None:
+            return
+        value = node.value
+        if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id in self.class_names):
+            return
+        if isinstance(value, (ast.Tuple, ast.List)):
+            members = self.tables.setdefault(name, set())
+            explicit = False
+            for elt in value.elts:
+                if isinstance(elt, ast.Attribute):
+                    members.add(elt.attr)
+                    explicit = True
+            if explicit:
+                return
+        for src in sources:
+            self.table_sources.setdefault(name, set()).add(src)
+
+    def _record_attr_type(self, node):
+        """``self.obj = SomeClass(...)`` -> remember what ``self.obj`` is."""
+        if len(node.targets) != 1:
+            return
+        name = _table_name(node.targets[0])
+        if name is None:
+            return
+        value = node.value
+        if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id in self.class_names):
+            self.attr_types[name] = value.func.id
+
+    def _getattr_sources(self, node):
+        """``(class name, name prefix or None)`` for each getattr receiver."""
+        out = set()
+        for sub in ast.walk(node):
+            if not (isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Name)
+                    and sub.func.id == "getattr" and sub.args):
+                continue
+            recv = sub.args[0]
+            cls = None
+            if isinstance(recv, ast.Name) and recv.id == "self":
+                cls = self.stack[-1] if self.stack else None
+            else:
+                holder = _table_name(recv)
+                if holder is not None:
+                    cls = self.attr_types.get(holder)
+            if cls is None:
+                continue
+            prefix = None
+            if len(sub.args) > 1:
+                arg = sub.args[1]
+                if (isinstance(arg, ast.BinOp)
+                        and isinstance(arg.op, ast.Add)
+                        and isinstance(arg.left, ast.Constant)
+                        and isinstance(arg.left.value, str)):
+                    prefix = arg.left.value
+            out.add((cls, prefix))
+        return out
 
     def _qual(self, name):
         return ".".join(self.stack + [name])
@@ -67,15 +159,41 @@ class Collector(ast.NodeVisitor):
         qual = self._qual(node.name)
         self.defs[qual] = (self.path, node.lineno, node.name)
         named = set()
-        attrs = set()
+        self_attrs = set()
+        other_attrs = set()
+        tables = set()
+        # Two passes over the body: the first learns the types of the
+        # attributes assigned here, which the second needs to tell what a
+        # getattr-built table holds.
+        assigns = []
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Assign):
+                assigns.append(sub)
+                self._record_attr_type(sub)
+        sources = self._getattr_sources(node)
+        for sub in assigns:
+            self._record_table(sub, sources)
         for sub in ast.walk(node):
             if isinstance(sub, ast.Call):
                 f = sub.func
                 if isinstance(f, ast.Name):
                     named.add(f.id)
                 elif isinstance(f, ast.Attribute):
-                    attrs.add(f.attr)
-        self.calls[qual] = (named, attrs)
+                    if (isinstance(f.value, ast.Name)
+                            and f.value.id == "self"):
+                        self_attrs.add(f.attr)
+                    else:
+                        other_attrs.add(f.attr)
+                elif isinstance(f, ast.Subscript):
+                    name = _table_name(f.value)
+                    if name is None:
+                        self.unresolved.append(
+                            (self.path, sub.lineno, qual))
+                    else:
+                        tables.add(name)
+                else:
+                    self.unresolved.append((self.path, sub.lineno, qual))
+        self.calls[qual] = (named, self_attrs, other_attrs, tables)
         self.stack.append(node.name)
         for child in node.body:
             self.visit(child)
@@ -88,10 +206,31 @@ class Collector(ast.NodeVisitor):
         self._function(node)
 
 
+def _table_name(node):
+    """``self.NAME`` as a plain name, or None."""
+    if (isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"):
+        return node.attr
+    return None
+
+
 def collect(package_dir):
     defs = {}
     raw_calls = {}
     classes = set()
+    tables = {}
+    table_sources = {}
+    unresolved = []
+    # Class names, to tell `self.x = Emit(...)` from `self.x = tuple(...)`.
+    class_names = set()
+    for root, dirs, files in os.walk(package_dir):
+        for f in sorted(files):
+            if f.endswith(".py"):
+                with open(os.path.join(root, f), "r") as fh:
+                    for sub in ast.walk(ast.parse(fh.read(), f)):
+                        if isinstance(sub, ast.ClassDef):
+                            class_names.add(sub.name)
     for root, dirs, files in os.walk(package_dir):
         for f in sorted(files):
             if not f.endswith(".py"):
@@ -100,7 +239,8 @@ def collect(package_dir):
             with open(path, "r") as fh:
                 src = fh.read()
             tree = ast.parse(src, path)
-            Collector(path, defs, raw_calls, classes).visit(tree)
+            Collector(path, defs, raw_calls, classes, tables,
+                      table_sources, unresolved, class_names).visit(tree)
 
     # Index the definitions for resolution.
     plain = {}      # bare name -> [qualname] for module-level functions
@@ -118,7 +258,9 @@ def collect(package_dir):
 
     calls = {}
     for qual in raw_calls:
-        named, attrs = raw_calls[qual]
+        named, self_attrs, other_attrs, call_tables = raw_calls[qual]
+        # The class this function is defined in, if any.
+        own_class = qual.rsplit(".", 2)[-2] + "." if "." in qual else None
         out = set()
         for n in named:
             if n in inits:
@@ -130,16 +272,56 @@ def collect(package_dir):
             if n not in inits and n not in plain:
                 for t in methods.get(n, ()):
                     out.add(t)
-        for a in attrs:
+        for a in self_attrs:
             if a == "__init__":
-                # `Base.__init__(self, ...)` goes up the hierarchy, never
-                # into one of our own methods; resolving it by name would
-                # make every constructor look self-recursive.
+                # `self.__init__(...)` is not written here; and resolving
+                # __init__ by name would make every constructor that calls a
+                # base constructor look self-recursive.
+                continue
+            own = None
+            if own_class is not None:
+                for t in methods.get(a, ()):
+                    if t.rsplit(".", 2)[-2] + "." == own_class:
+                        own = t
+            if own is not None:
+                out.add(own)
+            else:
+                for t in methods.get(a, ()):
+                    out.add(t)
+        for a in other_attrs:
+            if a == "__init__":
                 continue
             for t in methods.get(a, ()):
+                if (own_class is not None
+                        and t.rsplit(".", 2)[-2] + "." == own_class):
+                    continue
                 out.add(t)
+        for table in call_tables:
+            found = 0
+            # A table of explicit `self.m` references: the receiver's class
+            # is unknown, so resolve by name as elsewhere.
+            for a in tables.get(table, ()):
+                for t in methods.get(a, ()):
+                    out.add(t)
+                    found += 1
+            # A getattr-built table: the class *is* known, so add its own
+            # methods rather than every method sharing a name -- otherwise
+            # one `__init__` in the table drags in every class's.
+            for cls, prefix in table_sources.get(table, ()):
+                for name2 in methods:
+                    if prefix is not None and not name2.startswith(prefix):
+                        continue
+                    for t in methods[name2]:
+                        if t.rsplit(".", 2)[-2] == cls:
+                            out.add(t)
+                            found += 1
+            if not found:
+                info = defs.get(qual)
+                unresolved.append((info[0] if info else "?",
+                                   info[1] if info else 0,
+                                   "%s (table self.%s)" % (qual, table)))
         calls[qual] = out
-    return defs, calls
+    return defs, calls, unresolved
 
 
 def find_cycle(calls):
@@ -236,8 +418,14 @@ def main(argv):
         package = os.path.join(os.path.dirname(here), "mpyc")
     print("package: %s" % package)
     print("budget : %d frames" % budget)
-    defs, calls = collect(package)
+    defs, calls, unresolved = collect(package)
     print("defs   : %d functions" % len(defs))
+    if unresolved:
+        print("note   : %d indirect call site(s) could not be resolved;"
+              " the depth below is a lower bound at those points"
+              % len(unresolved))
+        for path, line, qual in unresolved:
+            print("         %s:%d  in %s" % (path, line, qual))
 
     cycle = find_cycle(calls)
     if cycle is not None:

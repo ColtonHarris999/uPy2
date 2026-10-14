@@ -248,6 +248,9 @@ class ParseTree:
         self._grow_to(max(1, capacity_slots))
         self.used = 1
         self.root = NODE_NULL
+        # Set by the parser: id and string leaves hold qstr numbers, so the
+        # tree is only readable alongside the pool that interned them.
+        self.pool = None
         self.consts = []
         self._const_index = {}
 
