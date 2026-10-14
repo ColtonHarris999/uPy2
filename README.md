@@ -52,7 +52,8 @@ and `weakref`, none of which exist at the pin.
 | `mpyc/parsetree.py` — packed parse tree | **done; memory budget cleared** |
 | `mpyc/qstrs.py` + `qstrtable.py` — static qstr pool | **done and verified against the oracle** |
 | `mpyc/tokens.py` + `lexer.py` — tokenizer | **done except t-strings; 2187 files token-exact** |
-| parser | next |
+| `mpyc/grammar.py` — grammar tables | **done; numbering confirmed against the C enum** |
+| parser engine + constant folding | in progress |
 | scope analysis, emitter | not started |
 
 **Container codec: 2083 / 2083 files byte-exact** against the pinned
@@ -164,6 +165,53 @@ subprocess is unavailable. CPython and MicroPython v1.29.0 agree:
 **Not yet done:** t-string interpolation (12 corpus files), which raises
 `NotImplementedFeature` rather than lexing wrongly. `\N{...}` unicode name
 escapes raise, matching the C lexer.
+
+### Grammar tables and the parse-tree oracle
+
+`tools/gen_grammar.py` reproduces the three tables `py/parse.c` builds from
+`py/grammar.h`'s macro DSL: **176 rules, 58 with a compile function,
+`RULE_const_object` at 58.** The numbering is part of the data format, since a
+struct node's kind *is* its rule index, and `parse.c` orders rules as every
+`DEF_RULE` in file order, then `RULE_const_object`, then every `DEF_RULE_NC`.
+
+That numbering is confirmed two ways. `tools/parsedump.c` rebuilds the enum
+through the real `py/grammar.h` and reports `RULE_const_object=58`,
+`RULE_maximum_number_of=176` — matching exactly. And the dumped kinds for real
+code line up with their names (`x = a + 1` is `expr_stmt` over `arith_expr`;
+`if`/`def`/`for`/`class` give `if_stmt`, `funcdef`, `for_stmt`, `classdef`).
+
+`parsedump` is the oracle for the engine. Nothing in MicroPython prints a
+parse tree — `mp_parse_node_print` is compiled out and the tree never reaches
+a `.mpy` — but `mp_parse()` is exported and `py/parse.h` makes the node layout
+public, so it links the real parser and walks the result.
+
+### The parser folds constants
+
+Worth stating plainly, because it expands the engine's scope: **constant
+folding happens in the parser, not the compiler.** `x = 1 + 2` produces no
+`arith_expr` node at all — just the value. Measured against the oracle:
+
+| source | parse tree |
+|---|---|
+| `1 + 2`, `2 * 3 + 4`, `1 << 3` | folded to a small-int leaf |
+| `1 / 2`, `0.5 + 0.25` | folded to a `const_object` (float) |
+| `(1, 2, 3)`, `(1, (2, 3))` | folded to a `const_object` tuple |
+| `(1, a)` | *not* folded — `atom_paren` over `testlist_comp` |
+| `'a' * 3` | *not* folded — `term` survives |
+| `1 if a else 2` | *not* folded |
+| `N = const(4)` then `N + 1` | folded to `4` via the const declaration |
+
+So `MICROPY_COMP_CONST`, `MICROPY_COMP_CONST_TUPLE` and
+`MICROPY_COMP_CONST_FOLDING` are all live and have to be ported with the
+engine.
+
+**A host/target divergence to expect here:** the oracle runs on a 64-bit host,
+where a parse node's small-int leaf holds up to 2^62, so `1 << 40` folds into
+a *leaf*. On the 32-bit target — and in our `array('i')` arena — the same value
+exceeds the 31-bit small int and must become a `const_object` instead. Both
+emit the same `.mpy`, since the container records `small_int_bits = 31` either
+way, but parse-tree comparison against the oracle needs to normalise integers
+outside the 31-bit range rather than treat the difference as a bug.
 
 ## Running the checks
 

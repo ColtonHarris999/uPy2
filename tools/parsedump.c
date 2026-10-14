@@ -39,6 +39,26 @@
 #include "py/runtime.h"
 #include "py/stackctrl.h"
 
+
+/* Rebuild the rule enum exactly as py/parse.c and py/compile.c do, so
+ * RULE_const_object carries the authoritative value rather than a guess.
+ * A const_object node's children hold an mp_obj_t, not parse nodes, so
+ * walking into one segfaults -- it has to be recognised. */
+enum {
+#define DEF_RULE(rule, comp, kind, ...) RULE_##rule,
+#define DEF_RULE_NC(rule, kind, ...)
+#include "py/grammar.h"
+#undef DEF_RULE
+#undef DEF_RULE_NC
+    RULE_const_object,
+#define DEF_RULE(rule, comp, kind, ...)
+#define DEF_RULE_NC(rule, kind, ...) RULE_##rule,
+#include "py/grammar.h"
+#undef DEF_RULE
+#undef DEF_RULE_NC
+    RULE_maximum_number_of,
+};
+
 static long heap_size = 64 * 1024 * 1024;
 
 /* Walk the tree iteratively: an input-shaped recursion could overflow the C
@@ -101,6 +121,23 @@ static void dump(mp_parse_node_t root) {
         mp_parse_node_struct_t *pns = (mp_parse_node_struct_t *)pn;
         size_t n = MP_PARSE_NODE_STRUCT_NUM_NODES(pns);
         size_t kind = MP_PARSE_NODE_STRUCT_KIND(pns);
+
+        if (kind == RULE_const_object) {
+            /* Folded constant: the slots hold an object, not parse nodes. */
+            vstr_t vstr;
+            mp_print_t pr;
+            vstr_init_print(&vstr, 16, &pr);
+            mp_obj_print_helper(&pr, mp_parse_node_extract_const_object(pns),
+                PRINT_REPR);
+            printf("C\t%d\t%lu\t", depth, (unsigned long)pns->source_line);
+            for (size_t i = 0; i < vstr_len(&vstr); ++i) {
+                printf("%02x", (unsigned char)vstr_str(&vstr)[i]);
+            }
+            printf("\n");
+            vstr_clear(&vstr);
+            continue;
+        }
+
         printf("S\t%d\t%lu\t%lu\t%lu\n", depth, (unsigned long)kind,
             (unsigned long)pns->source_line, (unsigned long)n);
         /* Push in reverse so children print left to right. */
@@ -119,6 +156,11 @@ int main(int argc, char **argv) {
         } else {
             path = argv[i];
         }
+    }
+    if (getenv("PARSEDUMP_RULES") != NULL) {
+        printf("RULE_const_object\t%d\n", RULE_const_object);
+        printf("RULE_maximum_number_of\t%d\n", RULE_maximum_number_of);
+        return 0;
     }
     if (path == NULL) {
         fprintf(stderr, "usage: parsedump [--mode file|single|eval] FILE.py\n");
