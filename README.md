@@ -50,8 +50,9 @@ and `weakref`, none of which exist at the pin.
 |---|---|
 | `mpyc/mpy_format.py` — `.mpy` container codec | **done and verified** |
 | `mpyc/parsetree.py` — packed parse tree | **done; memory budget cleared** |
-| static qstr table | next |
-| lexer, parser, scope analysis, emitter | not started |
+| `mpyc/qstrs.py` + `qstrtable.py` — static qstr pool | **done and verified against the oracle** |
+| lexer | next |
+| parser, scope analysis, emitter | not started |
 
 **Container codec: 2083 / 2083 files byte-exact** against the pinned
 `mpy-cross`, over MicroPython's own `tests/`, `lib/micropython-lib`, `tools/`
@@ -93,6 +94,44 @@ token is ~16 KB — a quarter of the budget. But `_sha256.py` is 4758 tokens in
 modules (large constant tables) are the risk case, not long ones. The
 node-per-token ratio is a proxy until the parser exists and can be measured
 directly.
+
+### Static qstr pool
+
+`.mpy` files refer to common strings by a fixed number instead of spelling
+them out, so the numbering has to be exact. The authoritative source is
+`static_qstr_list` in `py/makeqstrdata.py` — a literal Python list that
+`print_qstr_data` emits after `MP_QSTRnull`, before every other qstr, which
+is sorted per build. `tools/gen_qstrs.py` reads that list and cross-checks
+its output against the generated headers of both the mpy-cross and unix
+builds.
+
+The pool is **166 entries, qstr 0..165**, ending at `MP_QSTR_zip`
+(`QSTR_LAST_STATIC`). Both builds agree on all 166 and diverge only
+afterwards, which is what makes a static index portable.
+
+Validated differentially over 500 oracle-built `.mpy` files: **4272 static
+references and 17623 inline qstrs, zero disagreements.** The check is
+two-sided — every qstr the oracle wrote inline must be one our pool calls
+non-static, and every index it wrote must match our pool on both text and
+number.
+
+One trap worth knowing: qstr 0 is `MP_QSTRnull`, a sentinel, and its text is
+*also* the empty string. The real empty string is qstr 1, so interning `""`
+must yield 1. A naive text-to-index map gets this wrong silently.
+
+The pool holds 1110 bytes of actual text. Its heap cost depends on where the
+compiler's own code lives, measured on the 64-bit unix port:
+
+| | |
+|---|---|
+| importing the module fresh (strings allocated on the heap) | ~5.6 KB |
+| the tuple and lookup dict alone, strings already present | ~2.7 KB |
+
+For a compiler frozen into flash on the target the string data is in flash,
+so the heap cost is the second figure, and pointers halve again on 32 bits.
+Either way it is a constant, not a per-module, bite of the 64 KB budget.
+Packing the texts into one string plus an offset array would cut it to
+roughly 1.5 KB should the budget get tight.
 
 ## Running the checks
 
