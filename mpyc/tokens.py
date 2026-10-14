@@ -1,0 +1,282 @@
+"""Token kinds and keywords -- GENERATED, do not edit.
+
+Regenerate with ``tools/gen_tokens.py <micropython-source-tree>``.
+
+The numbering is this build's: the enum in ``py/lexer.h`` is conditional,
+so these values are only valid for the configuration recorded below.
+"""
+
+# Generated from mpy
+# Configuration:
+#   MICROPY_PY_ASYNC_AWAIT = 1
+#   MICROPY_PY_BUILTINS_STR_UNICODE = 1
+#   MICROPY_PY_FSTRINGS = 1
+#   MICROPY_PY_TSTRINGS = 1
+
+MP_TOKEN_END = 0
+MP_TOKEN_INVALID = 1
+MP_TOKEN_DEDENT_MISMATCH = 2
+MP_TOKEN_LONELY_STRING_OPEN = 3
+MP_TOKEN_MALFORMED_FSTRING = 4
+MP_TOKEN_NEWLINE = 5
+MP_TOKEN_INDENT = 6
+MP_TOKEN_DEDENT = 7
+MP_TOKEN_NAME = 8
+MP_TOKEN_INTEGER = 9
+MP_TOKEN_FLOAT_OR_IMAG = 10
+MP_TOKEN_STRING = 11
+MP_TOKEN_BYTES = 12
+MP_TOKEN_ELLIPSIS = 13
+MP_TOKEN_KW_FALSE = 14
+MP_TOKEN_KW_NONE = 15
+MP_TOKEN_KW_TRUE = 16
+MP_TOKEN_KW___DEBUG__ = 17
+MP_TOKEN_KW_AND = 18
+MP_TOKEN_KW_AS = 19
+MP_TOKEN_KW_ASSERT = 20
+MP_TOKEN_KW_ASYNC = 21
+MP_TOKEN_KW_AWAIT = 22
+MP_TOKEN_KW_BREAK = 23
+MP_TOKEN_KW_CLASS = 24
+MP_TOKEN_KW_CONTINUE = 25
+MP_TOKEN_KW_DEF = 26
+MP_TOKEN_KW_DEL = 27
+MP_TOKEN_KW_ELIF = 28
+MP_TOKEN_KW_ELSE = 29
+MP_TOKEN_KW_EXCEPT = 30
+MP_TOKEN_KW_FINALLY = 31
+MP_TOKEN_KW_FOR = 32
+MP_TOKEN_KW_FROM = 33
+MP_TOKEN_KW_GLOBAL = 34
+MP_TOKEN_KW_IF = 35
+MP_TOKEN_KW_IMPORT = 36
+MP_TOKEN_KW_IN = 37
+MP_TOKEN_KW_IS = 38
+MP_TOKEN_KW_LAMBDA = 39
+MP_TOKEN_KW_NONLOCAL = 40
+MP_TOKEN_KW_NOT = 41
+MP_TOKEN_KW_OR = 42
+MP_TOKEN_KW_PASS = 43
+MP_TOKEN_KW_RAISE = 44
+MP_TOKEN_KW_RETURN = 45
+MP_TOKEN_KW_TRY = 46
+MP_TOKEN_KW_WHILE = 47
+MP_TOKEN_KW_WITH = 48
+MP_TOKEN_KW_YIELD = 49
+MP_TOKEN_OP_ASSIGN = 50
+MP_TOKEN_OP_TILDE = 51
+MP_TOKEN_OP_LESS = 52
+MP_TOKEN_OP_MORE = 53
+MP_TOKEN_OP_DBL_EQUAL = 54
+MP_TOKEN_OP_LESS_EQUAL = 55
+MP_TOKEN_OP_MORE_EQUAL = 56
+MP_TOKEN_OP_NOT_EQUAL = 57
+MP_TOKEN_OP_PIPE = 58
+MP_TOKEN_OP_CARET = 59
+MP_TOKEN_OP_AMPERSAND = 60
+MP_TOKEN_OP_DBL_LESS = 61
+MP_TOKEN_OP_DBL_MORE = 62
+MP_TOKEN_OP_PLUS = 63
+MP_TOKEN_OP_MINUS = 64
+MP_TOKEN_OP_STAR = 65
+MP_TOKEN_OP_AT = 66
+MP_TOKEN_OP_DBL_SLASH = 67
+MP_TOKEN_OP_SLASH = 68
+MP_TOKEN_OP_PERCENT = 69
+MP_TOKEN_OP_DBL_STAR = 70
+MP_TOKEN_DEL_PIPE_EQUAL = 71
+MP_TOKEN_DEL_CARET_EQUAL = 72
+MP_TOKEN_DEL_AMPERSAND_EQUAL = 73
+MP_TOKEN_DEL_DBL_LESS_EQUAL = 74
+MP_TOKEN_DEL_DBL_MORE_EQUAL = 75
+MP_TOKEN_DEL_PLUS_EQUAL = 76
+MP_TOKEN_DEL_MINUS_EQUAL = 77
+MP_TOKEN_DEL_STAR_EQUAL = 78
+MP_TOKEN_DEL_AT_EQUAL = 79
+MP_TOKEN_DEL_DBL_SLASH_EQUAL = 80
+MP_TOKEN_DEL_SLASH_EQUAL = 81
+MP_TOKEN_DEL_PERCENT_EQUAL = 82
+MP_TOKEN_DEL_DBL_STAR_EQUAL = 83
+MP_TOKEN_DEL_PAREN_OPEN = 84
+MP_TOKEN_DEL_PAREN_CLOSE = 85
+MP_TOKEN_DEL_BRACKET_OPEN = 86
+MP_TOKEN_DEL_BRACKET_CLOSE = 87
+MP_TOKEN_DEL_BRACE_OPEN = 88
+MP_TOKEN_DEL_BRACE_CLOSE = 89
+MP_TOKEN_DEL_COMMA = 90
+MP_TOKEN_DEL_COLON = 91
+MP_TOKEN_DEL_PERIOD = 92
+MP_TOKEN_DEL_SEMICOLON = 93
+MP_TOKEN_DEL_EQUAL = 94
+MP_TOKEN_DEL_MINUS_MORE = 95
+
+# MP_TOKEN_NUMBER_OF in py/lexer.h: one past the last real token.
+TOKEN_COUNT = 96
+MP_TOKEN_NUMBER_OF = TOKEN_COUNT
+
+# kind -> name, for diagnostics and for diffing against the oracle
+TOKEN_NAMES = (
+    'MP_TOKEN_END',
+    'MP_TOKEN_INVALID',
+    'MP_TOKEN_DEDENT_MISMATCH',
+    'MP_TOKEN_LONELY_STRING_OPEN',
+    'MP_TOKEN_MALFORMED_FSTRING',
+    'MP_TOKEN_NEWLINE',
+    'MP_TOKEN_INDENT',
+    'MP_TOKEN_DEDENT',
+    'MP_TOKEN_NAME',
+    'MP_TOKEN_INTEGER',
+    'MP_TOKEN_FLOAT_OR_IMAG',
+    'MP_TOKEN_STRING',
+    'MP_TOKEN_BYTES',
+    'MP_TOKEN_ELLIPSIS',
+    'MP_TOKEN_KW_FALSE',
+    'MP_TOKEN_KW_NONE',
+    'MP_TOKEN_KW_TRUE',
+    'MP_TOKEN_KW___DEBUG__',
+    'MP_TOKEN_KW_AND',
+    'MP_TOKEN_KW_AS',
+    'MP_TOKEN_KW_ASSERT',
+    'MP_TOKEN_KW_ASYNC',
+    'MP_TOKEN_KW_AWAIT',
+    'MP_TOKEN_KW_BREAK',
+    'MP_TOKEN_KW_CLASS',
+    'MP_TOKEN_KW_CONTINUE',
+    'MP_TOKEN_KW_DEF',
+    'MP_TOKEN_KW_DEL',
+    'MP_TOKEN_KW_ELIF',
+    'MP_TOKEN_KW_ELSE',
+    'MP_TOKEN_KW_EXCEPT',
+    'MP_TOKEN_KW_FINALLY',
+    'MP_TOKEN_KW_FOR',
+    'MP_TOKEN_KW_FROM',
+    'MP_TOKEN_KW_GLOBAL',
+    'MP_TOKEN_KW_IF',
+    'MP_TOKEN_KW_IMPORT',
+    'MP_TOKEN_KW_IN',
+    'MP_TOKEN_KW_IS',
+    'MP_TOKEN_KW_LAMBDA',
+    'MP_TOKEN_KW_NONLOCAL',
+    'MP_TOKEN_KW_NOT',
+    'MP_TOKEN_KW_OR',
+    'MP_TOKEN_KW_PASS',
+    'MP_TOKEN_KW_RAISE',
+    'MP_TOKEN_KW_RETURN',
+    'MP_TOKEN_KW_TRY',
+    'MP_TOKEN_KW_WHILE',
+    'MP_TOKEN_KW_WITH',
+    'MP_TOKEN_KW_YIELD',
+    'MP_TOKEN_OP_ASSIGN',
+    'MP_TOKEN_OP_TILDE',
+    'MP_TOKEN_OP_LESS',
+    'MP_TOKEN_OP_MORE',
+    'MP_TOKEN_OP_DBL_EQUAL',
+    'MP_TOKEN_OP_LESS_EQUAL',
+    'MP_TOKEN_OP_MORE_EQUAL',
+    'MP_TOKEN_OP_NOT_EQUAL',
+    'MP_TOKEN_OP_PIPE',
+    'MP_TOKEN_OP_CARET',
+    'MP_TOKEN_OP_AMPERSAND',
+    'MP_TOKEN_OP_DBL_LESS',
+    'MP_TOKEN_OP_DBL_MORE',
+    'MP_TOKEN_OP_PLUS',
+    'MP_TOKEN_OP_MINUS',
+    'MP_TOKEN_OP_STAR',
+    'MP_TOKEN_OP_AT',
+    'MP_TOKEN_OP_DBL_SLASH',
+    'MP_TOKEN_OP_SLASH',
+    'MP_TOKEN_OP_PERCENT',
+    'MP_TOKEN_OP_DBL_STAR',
+    'MP_TOKEN_DEL_PIPE_EQUAL',
+    'MP_TOKEN_DEL_CARET_EQUAL',
+    'MP_TOKEN_DEL_AMPERSAND_EQUAL',
+    'MP_TOKEN_DEL_DBL_LESS_EQUAL',
+    'MP_TOKEN_DEL_DBL_MORE_EQUAL',
+    'MP_TOKEN_DEL_PLUS_EQUAL',
+    'MP_TOKEN_DEL_MINUS_EQUAL',
+    'MP_TOKEN_DEL_STAR_EQUAL',
+    'MP_TOKEN_DEL_AT_EQUAL',
+    'MP_TOKEN_DEL_DBL_SLASH_EQUAL',
+    'MP_TOKEN_DEL_SLASH_EQUAL',
+    'MP_TOKEN_DEL_PERCENT_EQUAL',
+    'MP_TOKEN_DEL_DBL_STAR_EQUAL',
+    'MP_TOKEN_DEL_PAREN_OPEN',
+    'MP_TOKEN_DEL_PAREN_CLOSE',
+    'MP_TOKEN_DEL_BRACKET_OPEN',
+    'MP_TOKEN_DEL_BRACKET_CLOSE',
+    'MP_TOKEN_DEL_BRACE_OPEN',
+    'MP_TOKEN_DEL_BRACE_CLOSE',
+    'MP_TOKEN_DEL_COMMA',
+    'MP_TOKEN_DEL_COLON',
+    'MP_TOKEN_DEL_PERIOD',
+    'MP_TOKEN_DEL_SEMICOLON',
+    'MP_TOKEN_DEL_EQUAL',
+    'MP_TOKEN_DEL_MINUS_MORE',
+)
+
+# tok_kw[] from py/lexer.c: sorted, and indexed from MP_TOKEN_KW_FALSE.
+KEYWORDS = (
+    'False',
+    'None',
+    'True',
+    '__debug__',
+    'and',
+    'as',
+    'assert',
+    'async',
+    'await',
+    'break',
+    'class',
+    'continue',
+    'def',
+    'del',
+    'elif',
+    'else',
+    'except',
+    'finally',
+    'for',
+    'from',
+    'global',
+    'if',
+    'import',
+    'in',
+    'is',
+    'lambda',
+    'nonlocal',
+    'not',
+    'or',
+    'pass',
+    'raise',
+    'return',
+    'try',
+    'while',
+    'with',
+    'yield',
+)
+
+KEYWORD_BASE = MP_TOKEN_KW_FALSE
+
+
+def keyword_kind(text):
+    """The token kind for keyword *text*, or None if it is not one.
+
+    Mirrors the lexer's loop: walk the sorted table and stop as soon as
+    an entry compares greater, so this is O(len(table)) at worst and
+    needs no dict.
+    """
+    i = 0
+    n = len(KEYWORDS)
+    while i < n:
+        kw = KEYWORDS[i]
+        if kw == text:
+            return KEYWORD_BASE + i
+        if kw > text:
+            return None
+        i += 1
+    return None
+
+
+def token_name(kind):
+    if 0 <= kind < TOKEN_COUNT:
+        return TOKEN_NAMES[kind]
+    return "MP_TOKEN_?%d" % kind

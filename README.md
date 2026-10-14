@@ -51,8 +51,9 @@ and `weakref`, none of which exist at the pin.
 | `mpyc/mpy_format.py` — `.mpy` container codec | **done and verified** |
 | `mpyc/parsetree.py` — packed parse tree | **done; memory budget cleared** |
 | `mpyc/qstrs.py` + `qstrtable.py` — static qstr pool | **done and verified against the oracle** |
-| lexer | next |
-| parser, scope analysis, emitter | not started |
+| `mpyc/tokens.py` + `lexer.py` — tokenizer | **done except t-strings; 2187 files token-exact** |
+| parser | next |
+| scope analysis, emitter | not started |
 
 **Container codec: 2083 / 2083 files byte-exact** against the pinned
 `mpy-cross`, over MicroPython's own `tests/`, `lib/micropython-lib`, `tools/`
@@ -132,6 +133,37 @@ so the heap cost is the second figure, and pointers halve again on 32 bits.
 Either way it is a constant, not a per-module, bite of the 64 KB budget.
 Packing the texts into one string plus an offset array would cut it to
 roughly 1.5 KB should the budget get tight.
+
+### Lexer
+
+`mpyc/lexer.py` ports `py/lexer.c` (1161 lines), keeping its shape: the token
+lives in `tok_kind` / `tok_line` / `tok_column` / `vstr` and `to_next()`
+advances, so there is no object per token. Three bytes of lookahead, because
+the longest decision — a prefix like `rb'` — needs that much.
+
+f-strings are rewritten *in the lexer*, as MicroPython does: `f"{x!r:>{w}}"`
+becomes the token stream for `"{!r:>{}}".format((x),(w),)`, spliced into the
+input and re-lexed, so the parser never learns f-strings exist. That also
+means the mechanism is unaware of Python syntax and cannot handle an
+expression containing `}` or `:` — a limitation to reproduce, not fix.
+
+**Verified against the oracle over 2187 files — every token's kind, line,
+column and text identical, zero mismatches.** Corpus: MicroPython's `tests/`,
+`lib/micropython-lib`, `tools/` and `py/` trees.
+
+The oracle is `tools/lexdump.c`, which links the real `py/lexer.c` out of the
+pinned mpy-cross build and prints its token stream; build it with
+`tools/build_lexdump.sh`. Without it a port this size has nothing to check
+itself against, since MicroPython exposes no way to see its own tokens.
+
+`tests/lexer_digest.py` reduces a whole stream to one order-sensitive digest,
+so the same corpus can be run under both runtimes and compared where
+subprocess is unavailable. CPython and MicroPython v1.29.0 agree:
+`files=120 tokens=18565 digest=45dda7d0`.
+
+**Not yet done:** t-string interpolation (12 corpus files), which raises
+`NotImplementedFeature` rather than lexing wrongly. `\N{...}` unicode name
+escapes raise, matching the C lexer.
 
 ## Running the checks
 
