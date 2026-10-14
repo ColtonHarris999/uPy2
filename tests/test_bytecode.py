@@ -128,6 +128,67 @@ def test_corpus(paths):
     check(bad == 0, "every prelude round-trips")
 
 
+def test_instructions(paths):
+    """Disassemble and re-emit every instruction in the corpus.
+
+    Two things are checked at once: that the operand shapes are right (the
+    walk must land exactly on the end of each function's bytecode, never
+    over- or under-running), and that re-encoding each instruction reproduces
+    its bytes.
+
+    The comparison happens inside the streaming loop: collecting a big
+    function's instructions first needs tens of kilobytes in one allocation,
+    which a real corpus function was large enough to fail on under
+    MicroPython.
+    """
+    files = 0
+    funcs = 0
+    instrs = 0
+    bad_walk = 0
+    bad_encode = 0
+    seen_ops = {}
+    for path in paths:
+        with open(path, "rb") as f:
+            data = f.read()
+        try:
+            mpy = mpy_format.decode(data)
+        except mpy_format.MpyError:
+            continue
+        files += 1
+        for rc in walk_raw_codes(mpy.raw_code, []):
+            funcs += 1
+            try:
+                p = B.decode_prelude(rc.fun_data)
+                for off, instr in B.disassemble(rc.fun_data, p.code_offset):
+                    instrs += 1
+                    seen_ops[instr.opcode] = seen_ops.get(instr.opcode, 0) + 1
+                    size = (instr.arg_size
+                            if instr.fmt == B._O.MP_BC_FORMAT_OFFSET else None)
+                    again = B.encode_instruction(instr.opcode, instr.arg,
+                                                 instr.extra,
+                                                 offset_size=size)
+                    if bytes(again) != rc.fun_data[off:off + instr.size]:
+                        if bad_encode < 4:
+                            print("FAIL bytes %s at %d: %r orig=%s mine=%s"
+                                  % (path, off, instr,
+                                     rc.fun_data[off:off + instr.size].hex(),
+                                     bytes(again).hex()))
+                        bad_encode += 1
+            except Exception as e:  # noqa: BLE001
+                if bad_walk < 4:
+                    print("FAIL walk %s: %r" % (path, e))
+                bad_walk += 1
+                continue
+    print("corpus: %d files, %d functions, %d instructions"
+          % (files, funcs, instrs))
+    print("        %d distinct opcodes exercised" % len(seen_ops))
+    print("        %d walk failures, %d encode mismatches"
+          % (bad_walk, bad_encode))
+    check(bad_walk == 0, "every function's bytecode walks exactly to its end")
+    check(bad_encode == 0, "every instruction re-encodes to its own bytes")
+    return seen_ops
+
+
 def find_mpy(root):
     out = []
     stack = [root]
@@ -192,6 +253,7 @@ def main(argv):
                         n += 1
     if paths:
         test_corpus(paths)
+        test_instructions(paths)
     else:
         print("corpus: none given (pass --mpy DIR or --mpy-cross PATH SRC...)")
 
@@ -199,7 +261,7 @@ def main(argv):
     if _fails:
         print("summary: failed=%d" % len(_fails))
         return 1
-    print("summary: all bytecode prelude checks passed")
+    print("summary: all bytecode checks passed")
     return 0
 
 

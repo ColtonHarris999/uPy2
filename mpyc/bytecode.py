@@ -293,3 +293,168 @@ def _emit_line_entry(b, l, out):
                              % (b, l))
         out.append(0x80 | b | ((l >> 4) & 0x70))
         out.append(l & 0xFF)
+
+
+# -- instructions --------------------------------------------------------
+#
+# An opcode's argument shape comes from its high nibble (mpyc/opcodes.py), so
+# there is no per-opcode table here either.  Mirrors mp_opcode_decode in
+# py/persistentcode.c and the emit_write_bytecode_* family in py/emitbc.c.
+
+from . import opcodes as _O  # noqa: E402
+
+
+class Instr:
+    """One decoded instruction."""
+
+    def __init__(self, opcode, fmt, arg, extra, size, arg_size):
+        self.opcode = opcode
+        self.fmt = fmt
+        self.arg = arg          # None for BYTE-format opcodes
+        self.extra = extra      # the trailing byte, or None
+        self.size = size        # total bytes, opcode included
+        self.arg_size = arg_size  # bytes the argument took
+
+    def __repr__(self):
+        return "Instr(%s, arg=%r, extra=%r, size=%d)" % (
+            _O.opcode_name(self.opcode), self.arg, self.extra, self.size)
+
+
+def decode_instruction(data, pos):
+    """Decode at *pos*.  Returns ``(Instr, new_pos)``."""
+    start = pos
+    opcode = data[pos]
+    pos += 1
+    fmt = _O.opcode_format(opcode)
+    arg = None
+    arg_start = pos
+    if fmt == _O.MP_BC_FORMAT_QSTR or fmt == _O.MP_BC_FORMAT_VAR_UINT:
+        arg = data[pos] & 0x7F
+        if opcode == _O.MP_BC_LOAD_CONST_SMALL_INT and (arg & 0x40):
+            # The only signed argument: sign-extend the first group.  C ORs in
+            # ~0 << 7 on an unsigned word; subtracting 0x80 is the same value
+            # with Python's arbitrary-precision ints, and the shifts below
+            # keep working because << preserves sign.
+            arg -= 0x80
+        while data[pos] & 0x80:
+            pos += 1
+            arg = (arg << 7) | (data[pos] & 0x7F)
+        pos += 1
+    elif fmt == _O.MP_BC_FORMAT_OFFSET:
+        if (data[pos] & 0x80) == 0:
+            arg = data[pos]
+            pos += 1
+            if _O.has_signed_offset(opcode):
+                arg -= 0x40
+        else:
+            arg = (data[pos] & 0x7F) | (data[pos + 1] << 7)
+            pos += 2
+            if _O.has_signed_offset(opcode):
+                arg -= 0x4000
+    arg_size = pos - arg_start
+    extra = None
+    if _O.has_extra_byte(opcode):
+        extra = data[pos]
+        pos += 1
+    return Instr(opcode, fmt, arg, extra, pos - start, arg_size), pos
+
+
+def encode_signed_int(num, out):
+    """emit_write_bytecode_byte_int's argument encoding.
+
+    Seven bits per byte, most significant first, with an extra byte added when
+    the top group's sign bit would otherwise misreport the sign.
+    """
+    groups = []
+    while True:
+        groups.append(num & 0x7F)
+        num >>= 7
+        if num == 0 or num == -1:
+            break
+    # The highest stored group's 0x40 bit must match the sign.
+    if num == -1 and (groups[-1] & 0x40) == 0:
+        groups.append(0x7F)
+    elif num == 0 and (groups[-1] & 0x40) != 0:
+        groups.append(0)
+    i = len(groups) - 1
+    while i > 0:
+        out.append(groups[i] | 0x80)
+        i -= 1
+    out.append(groups[0])
+
+
+def encode_offset(opcode, arg, out, size=None):
+    """A jump offset, in one or two bytes.
+
+    *size* forces the width.  The emitter uses one byte whenever the offset
+    fits and only ever shrinks across passes, so fresh code can leave it None
+    and get the minimal form; re-encoding decoded bytes passes the width that
+    was observed, so a wider encoding round-trips unchanged.
+    """
+    signed = _O.has_signed_offset(opcode)
+    if size is None:
+        if (signed and -64 <= arg <= 63) or (not signed and 0 <= arg <= 127):
+            size = 1
+        else:
+            size = 2
+    if size == 1:
+        v = arg + 0x40 if signed else arg
+        if not 0 <= v <= 0x7F:
+            raise ValueError("offset %d does not fit one byte" % arg)
+        out.append(v)
+    else:
+        v = arg + 0x4000 if signed else arg
+        if not 0 <= v <= 0x7FFF:
+            raise ValueError("offset %d does not fit two bytes" % arg)
+        out.append(0x80 | (v & 0x7F))
+        out.append(v >> 7)
+
+
+def encode_instruction(opcode, arg=None, extra=None, out=None,
+                       offset_size=None):
+    """Encode one instruction.  Returns the bytearray written to."""
+    if out is None:
+        out = bytearray()
+    out.append(opcode)
+    fmt = _O.opcode_format(opcode)
+    if fmt == _O.MP_BC_FORMAT_QSTR or fmt == _O.MP_BC_FORMAT_VAR_UINT:
+        if arg is None:
+            raise ValueError("%s needs an argument" % _O.opcode_name(opcode))
+        if opcode == _O.MP_BC_LOAD_CONST_SMALL_INT:
+            encode_signed_int(arg, out)
+        else:
+            encode_uint(arg, out)
+    elif fmt == _O.MP_BC_FORMAT_OFFSET:
+        if arg is None:
+            raise ValueError("%s needs an offset" % _O.opcode_name(opcode))
+        encode_offset(opcode, arg, out, offset_size)
+    elif arg is not None:
+        raise ValueError("%s takes no argument" % _O.opcode_name(opcode))
+    if _O.has_extra_byte(opcode):
+        if extra is None:
+            raise ValueError("%s needs its trailing byte"
+                             % _O.opcode_name(opcode))
+        out.append(extra)
+    elif extra is not None:
+        raise ValueError("%s has no trailing byte" % _O.opcode_name(opcode))
+    return out
+
+
+def disassemble(data, start=0, end=None):
+    """Yield ``(offset, Instr)`` for a run of bytecode.
+
+    A generator rather than a list: a large function holds thousands of
+    instructions, and materialising them all needs tens of kilobytes in one
+    allocation -- which the 64 KB budget cannot spare, and which a real
+    corpus function was large enough to blow.  Streaming keeps the cost to
+    one Instr at a time.
+    """
+    if end is None:
+        end = len(data)
+    pos = start
+    while pos < end:
+        instr, pos = decode_instruction(data, pos)
+        yield pos - instr.size, instr
+    if pos != end:
+        raise ValueError("bytecode overran its section by %d bytes"
+                         % (pos - end))

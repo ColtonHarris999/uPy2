@@ -55,9 +55,8 @@ and `weakref`, none of which exist at the pin.
 | `mpyc/grammar.py` — grammar tables | **done; numbering confirmed against the C enum** |
 | `mpyc/parser.py` — engine + constant folding | **done except t-strings; 2172 files tree-exact** |
 | `mpyc/scope.py` — scope and identifier analysis | **done** |
-| `mpyc/bytecode.py` — prelude and line-number codec | **done; 10010 functions round-trip** |
-| emitter: opcodes and instruction emission | next |
-| the compiler walker (`py/compile.c`) | not started |
+| `mpyc/opcodes.py` + `bytecode.py` — opcodes, prelude, instructions | **done; 462296 instructions round-trip** |
+| the compiler walker (`py/compile.c`) | next — the last big piece |
 
 **Container codec: 2083 / 2083 files byte-exact** against the pinned
 `mpy-cross`, over MicroPython's own `tests/`, `lib/micropython-lib`, `tools/`
@@ -349,3 +348,36 @@ oracle produces can be taken apart and rebuilt, and the bytes must match.
 byte**, identically under CPython and MicroPython v1.29.0 — exercising both
 header forms, multi-byte extensions, and both line-info encodings over
 whatever shapes the corpus holds.
+
+### Opcodes and instruction emission
+
+`py/bc0.h` does not carry a per-opcode argument table: the shape comes from an
+opcode's *high nibble* through a magic number,
+`(0x000003a4 >> (2 * (op >> 4))) & 3`. So `tools/gen_opcodes.py` takes the
+values and that magic number from the pinned header together, resolves the
+`BASE + offset` arithmetic most definitions use, and refuses to emit a table
+if the magic number ever changes or two opcodes collide.
+
+**77 opcodes** — BYTE 29, QSTR 13, VAR_UINT 24, OFFSET 11 — plus the five
+`*_MULTI` ranges, which encode their operand in the opcode byte and so span
+many values each.
+
+`mpyc/bytecode.py` decodes and encodes instructions: the MSB-first base-128
+argument, the one signed case (`LOAD_CONST_SMALL_INT`, where the top group's
+`0x40` bit must agree with the sign), one- or two-byte jump offsets with the
+signed-opcode range biased by `0x40`/`0x4000`, and the trailing byte that
+opcodes passing `(op & 0x9e) == 0` carry.
+
+**Verified over the corpus: 2083 files, 10010 functions, 462296 instructions,
+207 distinct opcode values, zero failures** — identically under CPython and
+MicroPython v1.29.0. Two properties at once: the walk lands *exactly* on the
+end of every function's bytecode, which is what validates the shape
+derivation for every opcode seen; and every instruction re-encodes to its own
+bytes, which validates emission.
+
+Running it on the target paid for itself again. `disassemble` originally
+returned a list, and one real corpus function was big enough that collecting
+its instructions asked for 64 KB in a single allocation and raised
+`MemoryError` under MicroPython. It is now a generator, and the test compares
+inside the streaming loop — the kind of allocation the budget cannot spare,
+caught before it reached silicon.
