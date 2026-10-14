@@ -268,6 +268,8 @@ python3 tests/test_parsetree.py tests/test_qstrs.py tests/test_scope.py
 | `tests/test_compile.py` | compile a corpus and require the `.mpy` to equal the oracle's, byte for byte |
 | `tests/compile_digest.py` | one digest per corpus, for comparing the two runtimes |
 | `tests/compile_heap.py` | peak live heap of a whole compile, sampled from inside |
+| `mpyc/floatfmt.py` | how a float constant is spelled, with the exact arithmetic that needs. A port of the `repr` path through `py/formatfloat.c`. |
+| `tests/test_floatfmt.py` | float spellings read back exactly, and the same text on either runtime |
 | `tools/lint_frames.py` | static call-graph check: no cycles, depth within budget |
 
 ### Parser engine
@@ -537,8 +539,7 @@ comment:
 | rejected by the oracle, rejected here | **119 / 119** |
 | accepted here but rejected by the oracle | **0** |
 | crashes | **0** |
-| the same files under CPython and MicroPython v1.29.0 | **2137 / 2138 identical** |
-| the one exception | the same file, same cause: `float_repr` borrows the runtime's `%e` (DEVIATIONS.md, D2) |
+| the same files under CPython and MicroPython v1.29.0 | **identical, all of them** |
 | frame budget | **13 of 32, zero cycles** |
 
 A single wrong byte anywhere — in the lexer, the folder, the scope analysis,
@@ -568,3 +569,50 @@ and both are commented as such: the trampoline indexes `self._steps` instead
 of a local alias, and `_s_emit` indexes `self._emit_fns` in place of binding
 it to a local first. A dispatch that the tool cannot see is a dispatch nobody
 can audit.
+
+### Spelling a float constant
+
+A float constant is stored in an `.mpy` as *text* — `save_obj` writes its
+`repr` — so the exact spelling is part of the file, and
+`mpyc/floatfmt.py` has to reproduce MicroPython's. That is not CPython's: at
+the pin, `repr` renders **16** significant digits and only goes further if the
+result does not read back as the same double, so MicroPython prints
+`8.888000000000001e+32` where CPython prints `8.888e+32`.
+
+The first version borrowed `"%.17e"` and `float(text)` to do the digits and
+the round-trip check. Both are the *runtime's* conversions, MicroPython's are
+not correctly rounded, and the corpus caught it: one file compiled to
+different bytes under CPython than under MicroPython. A compiler whose output
+depends on its host is not a compiler, so `floatfmt.py` now does its own exact
+arithmetic — a small fixed-purpose multiprecision integer over 30-bit limbs in
+an `array('i')`, with four operations (multiply by a small integer, divide by
+a small integer, compare, read out digits), every intermediate inside a signed
+64-bit value. Exactness is not optional for a second reason: "do 16 digits
+read back as this double?" is decided against a half-unit-in-the-last-place
+boundary, and an approximate answer picks the wrong number of digits.
+
+Sixteen or seventeen digits is the whole range, since seventeen always
+identify an IEEE double, so the search is one exact test rather than a loop —
+`formatfloat.c`'s 18 and 19 are unreachable once the rounding is correct.
+
+What is left is a 0.12% disagreement with the oracle on *which* of two
+16-digit spellings to use, and it is the oracle that comes off worse:
+
+| | |
+|---|---|
+| sample doubles whose spelling matches `mpy-cross` | 4218 of 4223 |
+| differ, both spellings denoting the same double | 3 |
+| **oracle spellings that do not denote their own value** under a correct parser | **2** |
+| spellings of ours that do not denote their own value | **0** |
+| corpus files affected | 1 of 2138 |
+
+`mpy-cross` verifies its spelling by re-reading it with MicroPython's parser,
+which is inexact in the same direction as its formatter, so the two agree with
+each other without the text being a faithful decimal for the double. Every
+spelling this compiler emits reads back exactly — under MicroPython's parser
+and under a correct one — which is the property the loader in
+`py/persistentcode.c` actually depends on. DEVIATIONS.md D2 has the numbers,
+including why matching the oracle's rounding is not worth wanting: a 32-bit
+target compiles `MICROPY_FLOAT_FORMAT_IMPL_APPROX` rather than `..._EXACT`,
+and those two were built and measured at the pin as disagreeing on **2290 of
+5631 doubles**.

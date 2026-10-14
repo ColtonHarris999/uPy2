@@ -40,29 +40,47 @@ A float constant is stored in an `.mpy` as text — `save_obj` writes its
 `py/objfloat.c` prints a float with `mp_print_float(..., 'g',
 PF_FLAG_ALWAYS_DECIMAL, ..., MP_FLOAT_REPR_PREC)`, and in `py/formatfloat.c`
 that magic precision means: render with **16** significant digits, and only if
-the result does not read back as the same double, try 17, 18 and 19. So
-MicroPython's `repr` is the shortest round-tripping form *at or above* 16
-digits, not the shortest overall — which is why it prints
-`8.888000000000001e+32` where CPython prints `8.888e+32`.
-`mpyc/mpy_format.float_repr` reproduces that, including the fixed 16-digit
-threshold for switching to an exponent (C's `%g` ties that threshold to the
-precision, so `%g` cannot be used directly).
+the result does not read back as the same double, use more. So MicroPython's
+`repr` is the shortest round-tripping form *at or above* 16 digits, not the
+shortest overall — which is why it prints `8.888000000000001e+32` where
+CPython prints `8.888e+32`. `mpyc/floatfmt.py` reproduces that, including the
+fixed 16-digit threshold for switching to an exponent (C's `%g` ties that
+threshold to the precision, so `%g` cannot be used to assemble the text
+either).
 
-What it does not reproduce is the oracle's *rounding* in the few cases where
-16 digits are ambiguous. `mpy-cross` scales the value by a power of ten in x86
-`long double`; 10^k is not exact in 64 bits of mantissa either, so the product
-can land a fraction of a unit from the correctly rounded value and the
-rounding goes the other way.
+It does so with its own exact arithmetic — a small fixed-purpose
+multiprecision integer over 30-bit limbs in an `array('i')`, with four
+operations — rather than by borrowing `"%.17e"` and `float(text)`. Two reasons,
+and the first is not about the oracle at all:
 
-Measured over 5631 doubles (a spread of awkward values plus a pseudo-random
-sweep of bit patterns): **16 disagree**, all of the form "two adjacent
-16-digit mantissas that both read back as the same double, and the oracle
-picks the other one", plus values sitting exactly on a power of ten
-(`1e+23` against `9.999999999999999e+22`). Over the 2269-file corpus
-**1 file** is affected (`tests/float/string_format_modulo.py`).
+1. **Those are the runtime's conversions, and MicroPython's are not correctly
+   rounded**, so the same source compiled under CPython and under MicroPython
+   gave different bytes. A compiler whose output depends on its host is not a
+   compiler. With the exact version, 4223 sample doubles and the whole
+   2269-file corpus produce identical output under both runtimes.
+2. **"Do 16 digits read back as this double?" is decided against a
+   half-unit-in-the-last-place boundary**, and an approximate answer picks the
+   wrong number of digits.
 
-*Rule:* emit the correctly rounded spelling. It always reads back as the
-intended double, which is what the bytecode depends on.
+Sixteen or seventeen digits is the whole range — seventeen always identify an
+IEEE double — so the search is one exact test rather than a loop; `formatfloat.c`'s
+18 and 19 are unreachable for a correctly rounded implementation.
+
+### What still differs from the oracle
+
+The oracle's *rounding*, in the few cases where 16 digits are ambiguous.
+`mpy-cross` scales by a power of ten in x86 `long double`; 10^k is not exact
+in 64 bits of mantissa either, so the product can land a fraction of a unit
+from the correctly rounded value and the rounding goes the other way.
+
+Measured over 5631 doubles (awkward values plus a pseudo-random sweep of bit
+patterns): **16 disagree**, all of them "two adjacent 16-digit mantissas that
+both read back as the same double, and the oracle picks the other one", plus
+values sitting exactly on a power of ten (`1e+23` against
+`9.999999999999999e+22`). Over the 2269-file corpus, **1 file** is affected
+(`tests/float/string_format_modulo.py`).
+
+*Rule:* emit the correctly rounded spelling.
 
 *Consequence for testing:* `tests/test_compile.py` counts a file whose only
 difference is a float constant as "float spelling only", but **only after
@@ -70,10 +88,30 @@ checking that the two spellings parse to the same float** and that everything
 else in the file is identical. A float difference that changes the value is a
 failure.
 
-*Why not reproduce it:* pure Python has no 80-bit float, and reproducing it
-would be reproducing a host artefact. A 32-bit target, where `long double`
-is `double`, compiles `MICROPY_FLOAT_FORMAT_IMPL_APPROX` rather than
-`..._EXACT` and does not agree with `mpy-cross` on those values either.
+*Why not reproduce the oracle here:* pure Python has no 80-bit float, and the
+target has no integer wider than signed 64-bit to emulate one with. Nor would
+it be the better answer. Two things argue against it:
+
+* **On the property that matters, correct rounding wins.** A float constant
+  has to be *read back* as the value the source meant, by the loader in
+  `py/persistentcode.c`. Of the 4223 sample values, every spelling this
+  compiler emits reads back exactly, under MicroPython's parser and under a
+  correct one. **Two of the oracle's do not**, under a correct parser:
+  it writes `-4.298023077864342e-36` for a double that decimal does not
+  denote, and `-1.698991219330538e-275` likewise. They survive because
+  `mpy-cross` checks its own spelling with MicroPython's parser, which is
+  inexact in the same direction as its formatter, so the two agree with each
+  other without the text being a faithful decimal.
+  `tests/test_floatfmt.py --oracle` reports that count separately rather than
+  against us.
+* **A 32-bit target does not produce the oracle's spelling either.** Where
+  `long double` is `double`, `MICROPY_FLOAT_FORMAT_IMPL_APPROX` is compiled
+  instead of `..._EXACT`. Built and measured at the pin: those two disagree on
+  **2290 of the same 5631 doubles** (41%), and the approximate one emits text
+  like `0.00000000000000102e-324` and 18-digit mantissas. Matching
+  `mpy-cross`'s exact path would still be wrong for such a target, and
+  matching the approximate path would cost 41% of byte-exactness for
+  something less accurate than either.
 
 ## D3. `OrderedDict({...})` is not special-cased
 
