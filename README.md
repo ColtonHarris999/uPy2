@@ -250,6 +250,9 @@ micropython -X heapsize=256M tests/compile_digest.py FILE.py...
 # what a compile costs on the target
 micropython tests/compile_heap.py FILE.py...
 
+# the compiler compiled by itself, to a fixed point
+python3 tools/bootstrap.py --micropython PATH --mpy-cross PATH --corpus DIR
+
 # the frame budget, statically
 python3 tools/lint_frames.py --budget 32
 
@@ -274,6 +277,7 @@ python3 tests/test_parsetree.py tests/test_qstrs.py tests/test_scope.py
 | `tests/compile_heap.py` | peak live heap of a whole compile, sampled from inside |
 | `mpyc/floatfmt.py` | how a float constant is spelled, with the exact arithmetic that needs. A port of the `repr` path through `py/formatfloat.c`. |
 | `tests/test_floatfmt.py` | float spellings read back exactly, and the same text on either runtime |
+| `tools/bootstrap.py` | compiles the compiler with itself, three stages, and checks the result is a fixed point |
 | `tools/lint_frames.py` | static call-graph check: no cycles, depth within budget |
 
 ### Parser engine
@@ -562,6 +566,7 @@ comment:
 | accepted here but rejected by the oracle | **0** |
 | crashes | **0** |
 | the same files under CPython and MicroPython v1.29.0 | **identical, all of them** |
+| the compiler compiled by itself | **a fixed point**: stage 0 == mpy-cross, stage 1 == stage 0, stage 2 == stage 1 |
 | frame budget | **13 of 32, zero cycles** |
 
 A single wrong byte anywhere — in the lexer, the folder, the scope analysis,
@@ -681,3 +686,80 @@ malformed ones produce the oracle's message verbatim (`malformed f-string`,
 oracle, and so runs on the device too. Each expectation in it was confirmed
 token-exact against `py/lexer.c` on the same input first — the table records
 what the C lexer does, rather than a guess at it.
+
+### Bootstrap: the compiler compiled by itself
+
+`tools/bootstrap.py` runs three stages over the same sources with the same
+file names, so that any difference in the output is a difference in the
+*compiler*:
+
+| stage | the compiler is | compiled by |
+|---|---|---|
+| 0 | `mpyc/*.py`, running on the host | — |
+| 1 | stage 0's `.mpy` files, running as its own bytecode | stage 0 |
+| 2 | stage 1's `.mpy` files | stage 1 |
+
+Each stage proves something the previous one cannot:
+
+* **stage 0 == `mpy-cross`** — the compiler compiles its own source
+  correctly. 18 of 18 modules byte-identical.
+* **stage 1 == stage 0** — running *as the bytecode it emits* does not change
+  what it emits. This is the step that would catch a bug in anything the
+  compiler leans on itself: a closure, a comprehension, a default argument,
+  an exception, a `try/finally`. It is now executing code it produced.
+* **stage 2 == stage 1** — a fixed point. Further rounds change nothing.
+
+```
+stage 0 vs mpy-cross:              18 files, 0 differ
+stage 1 vs stage 0:                18 files, 0 differ
+stage 2 vs stage 1:                18 files, 0 differ
+corpus: stage 1 vs stage 0:       986 files, 54 rejected alike, 0 differ
+```
+
+Self-compilation only exercises what the compiler's own source happens to
+use, so the corpus leg matters too: the `.mpy` compiler compiles 986 corpus
+files to bytes identical to the source compiler's, and refuses the same 54
+files for the same reasons (inline assembler, native decorators, deliberate
+syntax errors). *Which* files a stage refuses is compared as well as what it
+emits, since a compiler that quietly accepted more would otherwise pass.
+
+Two things the tool checks rather than assumes, because both would turn the
+test into the compiler compared against itself:
+
+* every one of the 18 modules reports a `__file__` ending in `.mpy` under the
+  expected stage directory — the import is verified *after* the first compile,
+  since some of the compiler's modules are imported lazily inside
+  `compile_source`;
+* the stages run from `/`, so the empty entry MicroPython puts on `sys.path`
+  cannot reach the checkout's own `mpyc/`. With an empty path directory the
+  stage fails with `ImportError: no module named 'mpyc'`, which is the
+  negative control.
+
+```sh
+python3 tools/bootstrap.py --micropython PATH --mpy-cross PATH [--corpus DIR...]
+```
+
+#### What it costs, and what that means for the device
+
+| | |
+|---|---|
+| the whole compiler as `.mpy` | **115 KB** |
+| loaded and warmed in RAM | 229 KB |
+| compiling `mpyc/scope.py` (293 lines) | 67 KB peak live |
+| compiling `mpyc/parser.py` (928 lines) | 139 KB peak live |
+| compiling `mpyc/compile.py` (2886 lines) | **451 KB peak live** |
+
+On the 64-bit unix port, so roughly halve for the target — but the shape is
+the point, and it is worth being plain about it: **the compiler cannot compile
+its own largest module on 256 KB of SRAM.** `mpyc/compile.py` is 2886 lines,
+fourteen times the 200-line module the 64 KB budget is written for, and the
+cost is linear in lines.
+
+That is not a contradiction of the budget, and self-hosting on silicon does
+not depend on it. The compiler is meant to ship **frozen** — 115 KB of flash,
+near-zero RAM, no self-compilation at runtime — and to compile user modules of
+ordinary size, which is exactly what the 64 KB figure covers. What the
+bootstrap establishes is that the bytecode it emits is correct enough to run
+the compiler itself, which is the strongest statement available without the
+hardware. If on-device self-compilation ever is wanted, `compile.py` would
+have to be split into modules of a few hundred lines each.
