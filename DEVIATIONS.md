@@ -123,7 +123,8 @@ MICROPY_PY_COLLECTIONS_ORDEREDDICT`, and `mpy-cross` sets
 
 A firmware build at the `EXTRA_FEATURES` ROM level *does*. Since the oracle
 defines byte-exactness and either form runs correctly, this compiler follows
-the oracle; `COMP_ORDEREDDICT_LITERAL` in `mpyc/compile.py` is the switch.
+the oracle; `COMP_ORDEREDDICT_LITERAL` in `mpyc/compile_defs.py` is the
+switch.
 
 ## D4. Which of two syntax errors gets reported
 

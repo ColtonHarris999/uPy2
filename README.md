@@ -271,7 +271,14 @@ python3 tests/test_parsetree.py tests/test_qstrs.py tests/test_scope.py
 | `tests/check_roundtrip.py` | `encode(decode(x)) == x` over a corpus, against the pinned oracle |
 | `tests/selftest_device.py` | the package running on MicroPython, with a heap watermark |
 | `mpyc/emitbc.py` | the emitter: the four-pass state machine, dead-code suppression, jump sizing, and one method per bytecode operation. A port of `py/emitbc.c`. |
-| `mpyc/compile.py` | the walker: a trampoline over an explicit work stack, one handler per grammar rule. A port of `py/compile.c`. |
+| `mpyc/compile.py` | the walker's entry points and pass driver, and `Compiler`, the last link of the chain below. A port of `py/compile.c`. |
+| `mpyc/compile_defs.py` | the walker's constants: the exception, the emitter-step table, the work-item kinds |
+| `mpyc/compile_walk.py` | `Walker`: the trampoline over an explicit work stack, the dispatch tables, the steps |
+| `mpyc/compile_assign.py` | `AssignWalker`: conditions, assignment, `del` |
+| `mpyc/compile_defn.py` | `DefnWalker`: scopes, parameters, `def`, `lambda`, `class`, declarations |
+| `mpyc/compile_stmt.py` | `StmtWalker`: simple statements, imports, `assert`, `if`, `while`, `for` |
+| `mpyc/compile_block.py` | `BlockWalker`: `try`, `with`, `async`, expression statements |
+| `mpyc/compile_expr.py` | `ExprWalker`: operators, trailers, calls, comprehensions, atoms |
 | `tests/test_compile.py` | compile a corpus and require the `.mpy` to equal the oracle's, byte for byte |
 | `tests/compile_digest.py` | one digest per corpus, for comparing the two runtimes |
 | `tests/compile_heap.py` | peak live heap of a whole compile, sampled from inside |
@@ -466,13 +473,28 @@ So the walk runs as a trampoline:
   statement after the loop.
 * Accumulators C keeps in `compiler_t` across a loop body — a call's argument
   counts, the saved break/continue labels, a function's default-argument
-  counters — live on two more explicit stacks, because the begin and the end
-  are now separate items.
+  counters — live on three more explicit stacks, because the begin and the
+  end are now separate items.
 
 The Python call depth is therefore constant regardless of how deeply the
 source nests. `tools/lint_frames.py` reports **13 frames against the 32-frame
 budget, with zero cycles**, and it now resolves the dispatch tables rather
 than losing the walker's depth to an indirect call (see below).
+
+The walker is one class, `Compiler`, but it is **spread over eight source
+modules as a chain of partial classes** — `Walker`, then `AssignWalker`,
+`DefnWalker`, `StmtWalker`, `BlockWalker`, `ExprWalker`, each inheriting the
+one before and `Compiler` last, with the constants they share in
+`compile_defs.py`. That is for the heap, not for taste: what a
+compile costs is roughly linear in the module's line count, and the walker in
+one piece was 2886 lines, so it was the one module of the package the compiler
+could not compile within reach of the budget (see *What it costs* below). No
+method is defined twice, so the order of the chain carries no meaning; it is a
+chain rather than a set of mixins only because multiple inheritance is a build
+option in MicroPython (`MICROPY_MULTIPLE_INHERITANCE`) and nothing here needs
+it. Dispatch still resolves across the whole chain, in the linter as well as
+at run time, because `_build_rule_table` looks its handlers up on the
+instance.
 
 Two recursive shapes in `compile.c` flatten into loops rather than work items,
 because the nesting is a chain rather than a tree: `compile_with_stmt_helper`
@@ -702,7 +724,7 @@ file names, so that any difference in the output is a difference in the
 Each stage proves something the previous one cannot:
 
 * **stage 0 == `mpy-cross`** — the compiler compiles its own source
-  correctly. 18 of 18 modules byte-identical.
+  correctly. 25 of 25 modules byte-identical.
 * **stage 1 == stage 0** — running *as the bytecode it emits* does not change
   what it emits. This is the step that would catch a bug in anything the
   compiler leans on itself: a closure, a comprehension, a default argument,
@@ -710,23 +732,24 @@ Each stage proves something the previous one cannot:
 * **stage 2 == stage 1** — a fixed point. Further rounds change nothing.
 
 ```
-stage 0 vs mpy-cross:              18 files, 0 differ
-stage 1 vs stage 0:                18 files, 0 differ
-stage 2 vs stage 1:                18 files, 0 differ
-corpus: stage 1 vs stage 0:       986 files, 54 rejected alike, 0 differ
+stage 0 vs mpy-cross:              25 files, 0 differ
+stage 1 vs stage 0:                25 files, 0 rejected alike, 0 differ
+stage 2 vs stage 1:                25 files, 0 rejected alike, 0 differ
+corpus: stage 1 vs stage 0:      1475 files, 103 rejected alike, 0 differ
 ```
 
 Self-compilation only exercises what the compiler's own source happens to
-use, so the corpus leg matters too: the `.mpy` compiler compiles 986 corpus
-files to bytes identical to the source compiler's, and refuses the same 54
-files for the same reasons (inline assembler, native decorators, deliberate
-syntax errors). *Which* files a stage refuses is compared as well as what it
-emits, since a compiler that quietly accepted more would otherwise pass.
+use, so the corpus leg matters too: over MicroPython's `tests/` tree the
+`.mpy` compiler compiles 1475 files to bytes identical to the source
+compiler's, and refuses the same 103 files for the same reasons (inline
+assembler, native decorators, deliberate syntax errors). *Which* files a
+stage refuses is compared as well as what it emits, since a compiler that
+quietly accepted more would otherwise pass.
 
 Two things the tool checks rather than assumes, because both would turn the
 test into the compiler compared against itself:
 
-* every one of the 18 modules reports a `__file__` ending in `.mpy` under the
+* every one of the 25 modules reports a `__file__` ending in `.mpy` under the
   expected stage directory — the import is verified *after* the first compile,
   since some of the compiler's modules are imported lazily inside
   `compile_source`;
@@ -743,23 +766,33 @@ python3 tools/bootstrap.py --micropython PATH --mpy-cross PATH [--corpus DIR...]
 
 | | |
 |---|---|
-| the whole compiler as `.mpy` | **115 KB** |
-| loaded and warmed in RAM | 229 KB |
-| compiling `mpyc/scope.py` (293 lines) | 67 KB peak live |
-| compiling `mpyc/parser.py` (928 lines) | 139 KB peak live |
-| compiling `mpyc/compile.py` (2886 lines) | **451 KB peak live** |
+| the whole compiler as `.mpy` | **119 KB**, 25 modules |
+| loaded and warmed in RAM | 219 KB |
+| compiling `mpyc/scope.py` (293 lines) | 57 KB peak live |
+| compiling `mpyc/compile_expr.py` (552 lines) | 102 KB peak live |
+| compiling `mpyc/parser.py` (928 lines) | 136 KB peak live |
+| compiling `mpyc/grammar.py` (577 lines, all tables) | **182 KB peak live** |
 
-On the 64-bit unix port, so roughly halve for the target — but the shape is
-the point, and it is worth being plain about it: **the compiler cannot compile
-its own largest module on 256 KB of SRAM.** `mpyc/compile.py` is 2886 lines,
-fourteen times the 200-line module the 64 KB budget is written for, and the
-cost is linear in lines.
+On the 64-bit unix port, so roughly halve for the target. The cost is linear
+in lines for ordinary code and worse for a module that is mostly constant
+tables, which is why 577 lines of `grammar.py` cost more than 928 of
+`parser.py`.
 
-That is not a contradiction of the budget, and self-hosting on silicon does
-not depend on it. The compiler is meant to ship **frozen** — 115 KB of flash,
-near-zero RAM, no self-compilation at runtime — and to compile user modules of
-ordinary size, which is exactly what the 64 KB figure covers. What the
-bootstrap establishes is that the bytecode it emits is correct enough to run
-the compiler itself, which is the strongest statement available without the
-hardware. If on-device self-compilation ever is wanted, `compile.py` would
-have to be split into modules of a few hundred lines each.
+Splitting the walker removed the one real outlier: in one piece
+`mpyc/compile.py` peaked at **451 KB**, fourteen times the 200-line module the
+64 KB budget is written for and far out of reach of 256 KB of SRAM. Its
+largest slice now peaks at 102 KB, which is the same band as the rest of the
+package — `grammar.py`, `parser.py`, `emitbc.py` and `lexer.py` are the four
+modules still above it, and halving for a 32-bit build puts them at roughly
+91, 68, 73 and 56 KB. So the package is within a factor of 1.5 of compiling
+every one of its own modules on the target, rather than a factor of seven.
+
+None of that is a contradiction of the budget, and self-hosting on silicon
+does not depend on it. The compiler is meant to ship **frozen** — 119 KB of
+flash, near-zero RAM, no self-compilation at runtime — and to compile user
+modules of ordinary size, which is exactly what the 64 KB figure covers. What
+the bootstrap establishes is that the bytecode it emits is correct enough to
+run the compiler itself, which is the strongest statement available without
+the hardware. If on-device self-compilation is ever wanted, the four modules
+above are what is left to split, and `grammar.py` would want its tables moved
+out rather than its code.
