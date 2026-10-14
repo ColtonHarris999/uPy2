@@ -104,9 +104,13 @@ once.
 modules of 150–260 lines, the median is 1009 tokens, which at one node per
 token is ~16 KB — a quarter of the budget. But `_sha256.py` is 4758 tokens in
 195 lines, and at the same ratio that is ~76 KB, over budget. Token-dense
-modules (large constant tables) are the risk case, not long ones. The
-node-per-token ratio is a proxy until the parser exists and can be measured
-directly.
+modules (large constant tables) are the risk case, not long ones.
+
+That was a proxy; the whole pipeline has since been measured on a **32-bit
+build** (`-m32`, 4-byte word, the target's shape). Over those 43 library
+modules a complete compile peaks at **21.0 KB minimum, 26.5 KB median,
+61.0 KB worst — and the worst is `_sha256.py`**, just inside the budget
+rather than over it. The ratio held; the constant did not.
 
 ### Static qstr pool
 
@@ -321,8 +325,9 @@ Measured on MicroPython v1.29.0, parsing real micropython-lib modules:
 
 **Live** is what survives a collect with the tree still held — the figure that
 has to last across all four compiler passes. Worst case so far is 33.7 KB
-against the 64 KB budget, on a 64-bit build, so a 32-bit target should be
-lower still for the pointer-heavy parts.
+against the 64 KB budget, on a 64-bit build; on a 32-bit build a *whole
+compile* of the same corpus of modules peaks at 61 KB worst case, 26.5 KB
+median (see *What it costs* below).
 
 The distinction matters: measured *without* collecting, the same parses look
 like 0.3–1.8 MB, because that counts every transient allocation. That churn is
@@ -589,6 +594,8 @@ comment:
 | crashes | **0** |
 | the same files under CPython and MicroPython v1.29.0 | **identical, all of them** |
 | the compiler compiled by itself | **a fixed point**: stage 0 == mpy-cross, stage 1 == stage 0, stage 2 == stage 1 |
+| the same files on a 32-bit build (4-byte word) | **identical**, 2269 files, digest `cace32bb` |
+| the same files with the compiler frozen into the firmware | **identical**, same digest, package absent from the filesystem |
 | frame budget | **13 of 32, zero cycles** |
 
 A single wrong byte anywhere — in the lexer, the folder, the scope analysis,
@@ -764,35 +771,56 @@ python3 tools/bootstrap.py --micropython PATH --mpy-cross PATH [--corpus DIR...]
 
 #### What it costs, and what that means for the device
 
+All of the following is **measured on a 32-bit build** of the v1.29.0 unix
+port (`-m32`: 4-byte word, 31-bit small ints, the target's shape), not scaled
+down from a 64-bit one.
+
+**What it takes to ship:**
+
 | | |
 |---|---|
-| the whole compiler as `.mpy` | **119 KB**, 25 modules |
-| loaded and warmed in RAM | 219 KB |
-| compiling `mpyc/scope.py` (293 lines) | 57 KB peak live |
-| compiling `mpyc/compile_expr.py` (552 lines) | 102 KB peak live |
-| compiling `mpyc/parser.py` (928 lines) | 136 KB peak live |
-| compiling `mpyc/grammar.py` (577 lines, all tables) | **182 KB peak live** |
+| source | 25 modules, 9682 lines, 346 KB |
+| as `.mpy` files | **119 KB** (122133 bytes) |
+| frozen into firmware | **125 KB of flash** (+102.3 KB `.rodata`, +25.0 KB const pointer tables), **0 bytes of static RAM** |
+| heap to import it, frozen | **24.6 KB**; 35.5 KB after the first compile has built its caches |
+| heap to import it from `.mpy` files | 157 KB |
 
-On the 64-bit unix port, so roughly halve for the target. The cost is linear
-in lines for ordinary code and worse for a module that is mostly constant
-tables, which is why 577 lines of `grammar.py` cost more than 928 of
-`parser.py`.
+Freezing is not a rounding difference: the compiler costs **24.6 KB of heap**
+to have available, against 157 KB loaded from `.mpy`. And the frozen build was
+run, not assumed — with the package absent from the filesystem it compiles the
+whole 2269-file corpus to the same digest, `cace32bb`.
 
-Splitting the walker removed the one real outlier: in one piece
-`mpyc/compile.py` peaked at **451 KB**, fourteen times the 200-line module the
-64 KB budget is written for and far out of reach of 256 KB of SRAM. Its
-largest slice now peaks at 102 KB, which is the same band as the rest of the
-package — `grammar.py`, `parser.py`, `emitbc.py` and `lexer.py` are the four
-modules still above it, and halving for a 32-bit build puts them at roughly
-91, 68, 73 and 56 KB. So the package is within a factor of 1.5 of compiling
-every one of its own modules on the target, rather than a factor of seven.
+**What a compile costs:**
 
-None of that is a contradiction of the budget, and self-hosting on silicon
-does not depend on it. The compiler is meant to ship **frozen** — 119 KB of
-flash, near-zero RAM, no self-compilation at runtime — and to compile user
-modules of ordinary size, which is exactly what the 64 KB figure covers. What
-the bootstrap establishes is that the bytecode it emits is correct enough to
-run the compiler itself, which is the strongest statement available without
-the hardware. If on-device self-compilation is ever wanted, the four modules
-above are what is left to split, and `grammar.py` would want its tables moved
-out rather than its code.
+| | |
+|---|---|
+| 43 micropython-lib modules, 150–260 lines | 21.0 KB min, **26.5 KB median**, 61.0 KB worst |
+| compiling `mpyc/compile.py` (396 lines) | 50.5 KB |
+| compiling `mpyc/compile_expr.py` (552 lines) | 77.6 KB |
+| compiling `mpyc/lexer.py` (875 lines) | 83.5 KB |
+| compiling `mpyc/parser.py` (928 lines) | 98.4 KB |
+| compiling `mpyc/emitbc.py` (719 lines) | 99.9 KB |
+| compiling `mpyc/grammar.py` (577 lines, all tables) | **102.3 KB** |
+| the walker before the split (2886 lines) | 348.8 KB |
+
+**The 64 KB budget holds for user code.** Every one of the 43 real library
+modules in the 150–260 line band compiles inside it, worst case 61.0 KB —
+including `_sha256.py`, the token-dense file predicted to be over.
+
+The compiler's own modules are a harder case because they are method-dense,
+and six of the 25 are still over 64 KB: `grammar.py`, `emitbc.py`,
+`parser.py`, `lexer.py`, `compile_expr.py`, and `compile_defn.py` by 144
+bytes. Splitting the walker is what brought that down — in one piece
+`mpyc/compile.py` peaked at **348.8 KB**, past 256 KB of SRAM entirely, and
+its largest slice is now 77.6 KB. The package went from one module that could
+not be compiled on the device at all to five that want a further split, the
+largest of them 1.6× the budget.
+
+None of which blocks silicon: the compiler ships **frozen**, 125 KB of flash
+and 24.6 KB of heap, and compiles user modules of ordinary size, which is
+exactly what the 64 KB figure covers. Self-compilation at runtime is not
+needed for that. What the bootstrap establishes is that the bytecode it emits
+is correct enough to run the compiler itself — the strongest statement
+available without the hardware. If on-device self-compilation is ever wanted,
+those five modules are what is left, and `grammar.py` wants its tables moved
+out rather than its code split.

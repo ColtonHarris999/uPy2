@@ -65,7 +65,7 @@ The walker is split across modules, as a chain of partial classes, because
 the compiler has to be able to compile itself.  The heap a compile needs is
 roughly linear in the module's line count, and the walker in one piece was
 2886 lines -- fourteen times the 200-line module the budget is written for,
-and it peaked at 451 KB where the budget is 64 KB.
+and it peaked at 349 KB on a 32-bit build where the budget is 64 KB.
 Each module holds one slice of ``Compiler`` and inherits the one before it:
 
 * ``compile_defs``   -- the constants, the exception, the work-item kinds
