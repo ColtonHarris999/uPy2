@@ -90,6 +90,29 @@ def our_lines(tree, pool):
     return rows
 
 
+_ORACLE_POOL = []
+
+
+def oracle_preloaded():
+    """mpy-cross's qstr pool, as bytes.
+
+    The shipped default is the *device's* pool, since that is what the
+    compiler runs against.  For comparing against mpy-cross we must hand the
+    parser mpy-cross's pool instead, or every long string literal that only
+    one build has interned would look like an engine bug.
+    """
+    if not _ORACLE_POOL:
+        try:
+            from oracle_qstr_pool import PRELOADED
+        except ImportError:
+            PRELOADED = frozenset()
+        encoded = set()
+        for t in PRELOADED:
+            encoded.add(t.encode("utf-8"))
+        _ORACLE_POOL.append(encoded)
+    return _ORACLE_POOL[0]
+
+
 def const_form(value):
     """Our constant in the oracle's structured spelling.
 
@@ -140,7 +163,7 @@ def compare(parsedump, path, mode):
     try:
         with open(path, "rb") as f:
             src = f.read()
-        lex_pool = P.QstrPool()
+        lex_pool = P.QstrPool(oracle_preloaded())
         from mpyc.lexer import Lexer
         pr = P.Parser(Lexer(path, src), MODES[mode], lex_pool)
         tree = pr.parse()

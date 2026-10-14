@@ -288,21 +288,32 @@ real but it is a GC-pressure and speed concern, not a budget violation. It is
 the obvious next optimisation if on-device parse time disappoints — the
 per-node `children` list and the constant-key tuples are the main sources.
 
-### An open decision: which qstr pool?
+### The qstr pool: the device's
 
 A string literal longer than 10 bytes becomes a qstr leaf only if an equal
 string **is already interned**, and a constant object otherwise — and those
-compile to different bytecode. So the result depends on the full qstr pool of
+compile to different bytecode. So the outcome depends on the full qstr pool of
 whichever build does the compiling, not just the portable 166 static qstrs.
 
-mpy-cross's pool holds 582 entries; the unix firmware's holds 773. They agree
-on the first 168 and diverge after. So for `'__contains__'`, mpy-cross emits a
-qstr leaf while a build without it in its pool would emit a constant object.
+**This compiler uses the device's pool**, because it runs on the device: a
+literal's fate must be decided by the pool its bytecode will actually run
+against. `mpyc/qstr_pool.py` is generated from a firmware build by
+`tools/gen_qstr_pool.py`; `QstrPool` also takes a pool as a parameter.
 
-`tools/gen_qstr_pool.py` generates this set, defaulting to mpy-cross's build
-because mpy-cross is the designated byte-exact oracle, and `QstrPool` takes it
-as a parameter. **But a compiler running on your silicon should be handed your
-firmware's pool, not mpy-cross's** — otherwise on-device compilation of the
-same source can differ from what mpy-cross produces. Worth deciding
-explicitly: match the oracle, match the device, or make it a build-time
-input.
+> The committed `mpyc/qstr_pool.py` is generated from the **unix port** (773
+> entries) as a stand-in. Regenerate it from your firmware's
+> `genhdr/qstrdefs.generated.h` before trusting its output on silicon.
+
+The accepted consequence: **mpy-cross is no longer a byte-exact oracle for
+every file.** The two pools are not nested — 465 entries are only in the unix
+build's, 274 only in mpy-cross's — and over the 2172-file corpus **42 files
+(1.9%) parse to different trees** depending on which pool is used
+(`tests/basics/fun_globals.py`, `tests/extmod/framebuf1.py`, …).
+
+So the differential tests hand the parser *mpy-cross's* pool
+(`tests/oracle_qstr_pool.py`), which keeps them checking the engine rather
+than the pool choice; on that footing the corpus is still 2172 exact. What
+they no longer prove is that on-device output matches mpy-cross byte for byte
+on those 42 files — by design, since matching the device is what was asked
+for. Validating those needs the device's own compiler as the reference, which
+the self-hosting bootstrap will provide.
